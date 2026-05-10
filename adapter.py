@@ -1,7 +1,7 @@
 """
 Sendblue platform adapter for Hermes Agent.
 
-Install this directory as ~/.hermes/plugins/platforms/sendblue and Hermes can
+Install this directory as ~/.hermes/plugins/sendblue and Hermes can
 receive and send iMessage/SMS/RCS through Sendblue from the gateway loop.
 """
 
@@ -865,7 +865,7 @@ def register(ctx: Any) -> None:
         validate_config=validate_config,
         is_connected=is_connected,
         required_env=["SENDBLUE_API_KEY", "SENDBLUE_API_SECRET", "SENDBLUE_PHONE_NUMBER"],
-        install_hint="Install this plugin under ~/.hermes/plugins/platforms/sendblue and set Sendblue credentials",
+        install_hint="Install this plugin under ~/.hermes/plugins/sendblue and set Sendblue credentials",
         setup_fn=interactive_setup,
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="SENDBLUE_HOME_CHANNEL",

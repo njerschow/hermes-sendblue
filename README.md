@@ -2,7 +2,7 @@
 
 Text your [Hermes Agent](https://hermes-agent.nousresearch.com/docs/) over iMessage, SMS, or RCS with [Sendblue](https://docs.sendblue.com/).
 
-This is the Hermes Agent version of `openclaw-sendblue`: a third-party Hermes platform plugin that lives under `~/.hermes/plugins/platforms/sendblue` and plugs into `hermes gateway`.
+This is the Hermes Agent version of `openclaw-sendblue`: a third-party Hermes platform plugin that lives under `~/.hermes/plugins/sendblue` and plugs into `hermes gateway`.
 
 ## What It Supports
 
@@ -53,10 +53,10 @@ From this repo:
 ./install.sh
 ```
 
-That symlinks the repo to `$HERMES_HOME/plugins/platforms/sendblue`, defaulting to:
+That symlinks the repo to `$HERMES_HOME/plugins/sendblue`, defaulting to:
 
 ```text
-~/.hermes/plugins/platforms/sendblue
+~/.hermes/plugins/sendblue
 ```
 
 ### 4. Enable and Configure
@@ -169,7 +169,7 @@ The plugin includes a standalone sender so cron can deliver even when the cron p
 Check plugin discovery:
 
 ```bash
-ls -la "${HERMES_HOME:-$HOME/.hermes}/plugins/platforms/sendblue"
+ls -la "${HERMES_HOME:-$HOME/.hermes}/plugins/sendblue"
 hermes plugins list
 hermes gateway status
 ```

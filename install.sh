@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 hermes_home="${HERMES_HOME:-$HOME/.hermes}"
-target="$hermes_home/plugins/platforms/sendblue"
+target="$hermes_home/plugins/sendblue"
 
 mkdir -p "$(dirname "$target")"
 
