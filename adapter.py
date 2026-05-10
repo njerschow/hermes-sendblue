@@ -28,6 +28,7 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 logger = logging.getLogger("gateway.platforms.sendblue")
 
 DEFAULT_API_BASE = "https://api.sendblue.com"
+DEFAULT_USER_AGENT = "sendblue-hermes/1.0 (+https://github.com/njerschow/hermes-sendblue)"
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_LOOKBACK_SECONDS = 60
 DEFAULT_LIMIT = 100
@@ -224,7 +225,9 @@ class SendblueClient:
 
     def _headers(self) -> Dict[str, str]:
         return {
+            "Accept": "application/json",
             "Content-Type": "application/json",
+            "User-Agent": DEFAULT_USER_AGENT,
             "sb-api-key-id": self.settings.api_key,
             "sb-api-secret-key": self.settings.api_secret,
         }
