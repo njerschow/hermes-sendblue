@@ -1,0 +1,6 @@
+[project]
+name = "hermes-sendblue"
+version = "1.0.0"
+description = "Hermes Agent platform plugin for Sendblue iMessage/SMS/RCS"
+requires-python = ">=3.11"
+license = { text = "MIT" }

@@ -1,0 +1,58 @@
+name: sendblue-platform
+label: Sendblue
+kind: platform
+version: 1.0.0
+description: >
+  Hermes Agent gateway adapter for Sendblue. Lets Hermes receive and send
+  iMessage, SMS, and RCS through the Sendblue API.
+author: Sendblue
+requires_env:
+  - name: SENDBLUE_API_KEY
+    description: "Sendblue API key from dashboard.sendblue.com or `sendblue show-keys`."
+    prompt: "Sendblue API key"
+    password: true
+  - name: SENDBLUE_API_SECRET
+    description: "Sendblue API secret from dashboard.sendblue.com or `sendblue show-keys`."
+    prompt: "Sendblue API secret"
+    password: true
+  - name: SENDBLUE_PHONE_NUMBER
+    description: "Your assigned Sendblue phone number in E.164 format."
+    prompt: "Sendblue phone number"
+    password: false
+optional_env:
+  - name: SENDBLUE_ALLOWED_USERS
+    description: "Comma-separated phone numbers allowed to talk to Hermes. Leave empty to use Hermes pairing."
+    prompt: "Allowed phone numbers"
+    password: false
+  - name: SENDBLUE_ALLOW_ALL_USERS
+    description: "Allow any sender to talk to Hermes. Not recommended for agents with terminal access."
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: SENDBLUE_HOME_CHANNEL
+    description: "Default phone number for `deliver=sendblue` cron jobs and notifications."
+    prompt: "Default delivery phone"
+    password: false
+  - name: SENDBLUE_POLL_INTERVAL_SECONDS
+    description: "Polling interval for inbound messages when webhook mode is disabled. Default: 5."
+    prompt: "Poll interval seconds"
+    password: false
+  - name: SENDBLUE_WEBHOOK_ENABLED
+    description: "Enable local webhook listener instead of polling. Requires a public HTTPS tunnel or reverse proxy."
+    prompt: "Enable webhook? (true/false)"
+    password: false
+  - name: SENDBLUE_WEBHOOK_HOST
+    description: "Webhook bind host. Default: 127.0.0.1."
+    prompt: "Webhook host"
+    password: false
+  - name: SENDBLUE_WEBHOOK_PORT
+    description: "Webhook local port. Default: 3141."
+    prompt: "Webhook port"
+    password: false
+  - name: SENDBLUE_WEBHOOK_PATH
+    description: "Webhook path. Default: /webhook/sendblue."
+    prompt: "Webhook path"
+    password: false
+  - name: SENDBLUE_WEBHOOK_SECRET
+    description: "Secret expected in Sendblue's sb-signing-secret header."
+    prompt: "Webhook secret"
+    password: true
