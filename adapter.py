@@ -35,6 +35,7 @@ DEFAULT_LIMIT = 100
 MAX_SENDBLUE_BODY_CHARS = 18_000
 MAX_WEBHOOK_BODY_BYTES = 1024 * 1024
 MIN_WEBHOOK_SECRET_CHARS = 16
+SENDBLUE_MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # Sendblue documented per-file limit
 
 
 def _is_truthy(value: Any) -> bool:
@@ -121,6 +122,22 @@ def _iso_utc(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _is_local_media(value: Any) -> bool:
+    text = str(value or "")
+    return bool(text) and not text.startswith(("http://", "https://"))
+
+
+def _build_multipart(filename: str, data: bytes, boundary: str) -> bytes:
+    safe_name = filename.replace('"', "").replace("\r", "").replace("\n", "")
+    header = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{safe_name}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n"
+    ).encode("utf-8")
+    footer = f"\r\n--{boundary}--\r\n".encode("utf-8")
+    return header + data + footer
 
 
 def _hermes_home() -> Path:
@@ -223,14 +240,16 @@ class SendblueClient:
     def __init__(self, settings: SendblueSettings):
         self.settings = settings
 
-    def _headers(self) -> Dict[str, str]:
-        return {
+    def _headers(self, *, content_type: Optional[str] = "application/json") -> Dict[str, str]:
+        headers: Dict[str, str] = {
             "Accept": "application/json",
-            "Content-Type": "application/json",
             "User-Agent": DEFAULT_USER_AGENT,
             "sb-api-key-id": self.settings.api_key,
             "sb-api-secret-key": self.settings.api_secret,
         }
+        if content_type is not None:
+            headers["Content-Type"] = content_type
+        return headers
 
     def _json_request_sync(
         self,
@@ -346,6 +365,55 @@ class SendblueClient:
             "/api/mark-read",
             body=body,
         )
+
+    def _raw_post_sync(
+        self,
+        path: str,
+        headers: Dict[str, str],
+        body: bytes,
+        *,
+        timeout: float = 60.0,
+    ) -> Dict[str, Any]:
+        url = f"{self.settings.api_base}{path}"
+        req = request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
+        except error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Sendblue API error {exc.code}: {raw}") from exc
+        except error.URLError as exc:
+            raise RuntimeError(f"Sendblue API connection error: {exc}") from exc
+
+    async def upload_file_from_bytes(self, filename: str, data: bytes) -> str:
+        if not data:
+            raise ValueError(f"File '{filename}' is empty")
+        if len(data) > SENDBLUE_MAX_UPLOAD_BYTES:
+            raise ValueError(
+                f"File '{filename}' is {len(data)} bytes, exceeds Sendblue limit "
+                f"of {SENDBLUE_MAX_UPLOAD_BYTES} bytes"
+            )
+
+        boundary = f"----SendblueUpload{int(time.time() * 1000)}{os.urandom(8).hex()}"
+        body = _build_multipart(filename, data, boundary)
+        headers = self._headers(content_type=None)
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+
+        payload = await asyncio.to_thread(
+            self._raw_post_sync, "/api/upload-file", headers, body
+        )
+        media_url = payload.get("media_url")
+        if not media_url:
+            raise RuntimeError(f"Sendblue upload returned no media_url: {payload}")
+        return str(media_url)
+
+    async def upload_file(self, file_path: str) -> str:
+        path = Path(file_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Local media path not found: {file_path}")
+        data = await asyncio.to_thread(path.read_bytes)
+        return await self.upload_file_from_bytes(path.name, data)
 
 
 class ProcessedMessageStore:
@@ -684,6 +752,37 @@ class SendblueAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("Sendblue typing indicator failed", exc_info=True)
 
+    async def _attach_local_or_remote(
+        self,
+        chat_id: str,
+        media: str,
+        caption: Optional[str] = None,
+    ) -> SendResult:
+        """Upload a local file (or pass through a URL) and send it as a Sendblue attachment."""
+        target = _normalize_phone(chat_id)
+        if not target:
+            return SendResult(success=False, error="Missing destination phone number")
+        if not media:
+            return SendResult(success=False, error="Missing media path or URL")
+
+        media_url = media
+        if _is_local_media(media):
+            try:
+                media_url = await self.client.upload_file(media)
+                logger.info("Sendblue uploaded local file %s -> %s", media, media_url)
+            except (FileNotFoundError, ValueError) as exc:
+                return SendResult(success=False, error=str(exc), retryable=False)
+            except Exception as exc:
+                return SendResult(success=False, error=str(exc), retryable=True)
+
+        try:
+            message_id = await self.client.send_message(
+                target, caption or "", media_url=media_url
+            )
+            return SendResult(success=True, message_id=message_id)
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc), retryable=True)
+
     async def send_image(
         self,
         chat_id: str,
@@ -693,17 +792,56 @@ class SendblueAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         del reply_to, metadata
-        if not image_url.startswith(("http://", "https://")):
-            return await self.send(chat_id=chat_id, content=f"{caption or ''}\n{image_url}".strip())
-        try:
-            message_id = await self.client.send_message(
-                _normalize_phone(chat_id),
-                caption or "",
-                media_url=image_url,
-            )
-            return SendResult(success=True, message_id=message_id)
-        except Exception as exc:
-            return SendResult(success=False, error=str(exc), retryable=True)
+        return await self._attach_local_or_remote(chat_id, image_url, caption)
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del reply_to, metadata, kwargs
+        return await self._attach_local_or_remote(chat_id, image_path, caption)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del file_name, reply_to, metadata, kwargs
+        return await self._attach_local_or_remote(chat_id, file_path, caption)
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del reply_to, metadata, kwargs
+        return await self._attach_local_or_remote(chat_id, video_path, caption)
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del reply_to, metadata, kwargs
+        return await self._attach_local_or_remote(chat_id, audio_path, caption)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         phone = _normalize_phone(chat_id)
@@ -779,10 +917,19 @@ async def _standalone_send(
             ids.append(await client.send_message(target, chunk))
 
         for media in media_files or []:
-            if str(media).startswith(("http://", "https://")):
-                ids.append(await client.send_message(target, "", media_url=str(media)))
+            media_str = str(media)
+            if _is_local_media(media_str):
+                try:
+                    uploaded_url = await client.upload_file(media_str)
+                except Exception as exc:
+                    return {
+                        "error": (
+                            f"Sendblue standalone send failed to upload {media_str}: {exc}"
+                        )
+                    }
+                ids.append(await client.send_message(target, "", media_url=uploaded_url))
             else:
-                ids.append(await client.send_message(target, f"Generated file: {media}"))
+                ids.append(await client.send_message(target, "", media_url=media_str))
 
         return {"success": True, "message_id": ",".join(ids) if ids else ""}
     except Exception as exc:
@@ -882,6 +1029,7 @@ def register(ctx: Any) -> None:
         platform_hint=(
             "You are chatting through Sendblue over iMessage/SMS/RCS. "
             "Phone screens are small, so keep replies concise unless the user asks for detail. "
-            "Sendblue can deliver image URLs as media attachments; local generated files may need a public URL."
+            "Sendblue delivers images, videos, audio, and documents as native iMessage/SMS attachments — "
+            "local file paths in MEDIA:<path> tags are uploaded automatically."
         ),
     )

@@ -13,6 +13,7 @@ This is the Hermes Agent version of `openclaw-sendblue`: a third-party Hermes pl
 - De-duplication with a small SQLite store under `~/.hermes/platforms/sendblue`
 - Cron/notification delivery with `deliver=sendblue` and `SENDBLUE_HOME_CHANNEL`
 - Public CDN-style image URL delivery as Sendblue media attachments
+- Local file attachments uploaded automatically via Sendblue's `/api/upload-file` (max 100 MB)
 
 ## Quick Start
 
@@ -128,7 +129,7 @@ https://your-public-host/webhook/sendblue
 
 Set the same secret in Sendblue. This adapter accepts it from `sb-signing-secret`, `x-sendblue-secret`, `x-webhook-secret`, or `Authorization: Bearer ...`. Webhook mode will not start with an empty secret or `change-me`.
 
-Sendblue media URLs should be public CDN-style URLs with file extensions. Signed URLs and local files may need to be uploaded to stable public storage first.
+Local file paths handed to the adapter (via `send_image` or cron `media_files`) are uploaded to Sendblue and delivered as attachments. Public `http(s)` URLs are passed through as-is — if you have signed or ephemeral URLs, host them somewhere stable first.
 
 ## Config.yaml Alternative
 
