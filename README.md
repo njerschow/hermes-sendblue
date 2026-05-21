@@ -19,7 +19,7 @@ This is the Hermes Agent version of `openclaw-sendblue`: a third-party Hermes pl
 
 ### 1. Get Sendblue Credentials
 
-If you use the Sendblue CLI:
+Use the Sendblue CLI:
 
 ```bash
 node --version  # must be v18 or newer
@@ -28,6 +28,8 @@ sendblue setup      # new Sendblue account
 # or: sendblue login  # existing Sendblue account
 sendblue show-keys
 ```
+
+Alternatively, grab the same values from your dashboard at [dashboard.sendblue.com](https://dashboard.sendblue.com)
 
 You need:
 
@@ -111,7 +113,9 @@ Because Hermes can run terminal commands, avoid open access on public numbers.
 
 ## Webhook Mode
 
-Polling works without a public endpoint. For lower-latency delivery, enable webhooks:
+Polling (the default) works without a public endpoint and checks Sendblue for new messages every 5 seconds. Tune this with `SENDBLUE_POLL_INTERVAL_SECONDS` (minimum 1 second).
+
+For lower-latency delivery, enable webhooks:
 
 ```bash
 SENDBLUE_WEBHOOK_ENABLED=true
@@ -189,6 +193,21 @@ Common fixes:
 - If your first inbound test does not arrive, text the Sendblue number from your verified/allowed phone once, then restart the gateway
 - In webhook mode, confirm your public URL forwards to the configured local port
 - If another Hermes profile is using the same Sendblue line, stop that gateway first
+
+## Known Issues
+
+### Files with uppercase extensions can't be sent
+
+If you try to attach a file with an uppercase extension like `.JPG`, `.PNG`, `.PDF`, or `.MP4`, the message will be delivered with the caption text but **no attachment**. There is no error — the agent just appears to "forget" the file.
+
+**Workaround:** rename or copy the file to use a lowercase extension before sending.
+
+```bash
+cp MyPhoto.JPG myphoto.jpg
+# then send myphoto.jpg
+```
+
+**Why:** This is an upstream bug in hermes-agent itself, not this plugin. Its `extract_media` regex in `gateway/platforms/base.py` is compiled without `re.IGNORECASE`, so paths with uppercase extensions never match. 
 
 ## Development
 
