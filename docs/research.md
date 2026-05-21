@@ -1,12 +1,12 @@
 # Research Notes
 
-Research date: 2026-05-10.
+Research date: 2026-05-10. Revised: 2026-05-21.
 
 ## Hermes Agent Findings
 
 - Hermes Agent is the Nous Research self-improving agent with a CLI and a long-running messaging gateway. The official README describes CLI, gateway, skills, memory, cron scheduling, and OpenClaw migration support.
 - Hermes' messaging gateway is the right integration point for Sendblue. It routes platform adapter events to a per-chat Hermes session and then to `AIAgent`.
-- Current Hermes docs recommend third-party messaging integrations as platform plugins under `~/.hermes/plugins/platforms/<platform>/` with a `plugin.yaml` manifest and an `adapter.py` entry point. One developer page still shows the older root `~/.hermes/plugins/<platform>/` example, but the plugin overview and env-var loader both point to `plugins/platforms/<name>/`.
+- Third-party Hermes plugins install at `~/.hermes/plugins/<name>/` with a `plugin.yaml` manifest and an `adapter.py` entry point exposing `register(ctx)`. The `plugins/platforms/<name>/` path under the hermes-agent repo itself is reserved for **bundled** adapters that ship with Hermes core (see `gateway/config.py:_scan_bundled_plugin_platforms` and `gateway/platforms/ADDING_A_PLATFORM.md`); the plugin loader does not scan `~/.hermes/plugins/platforms/`.
 - Platform adapters extend `BasePlatformAdapter` and implement `connect()`, `disconnect()`, `send()`, and `get_chat_info()`. Inbound messages are normalized into `MessageEvent` objects and handed to `handle_message()`.
 - Plugin registration supports useful Sendblue-specific hooks: `allowed_users_env`, `allow_all_env`, `env_enablement_fn`, `cron_deliver_env_var`, `standalone_sender_fn`, `max_message_length`, `pii_safe`, and `platform_hint`.
 - Hermes supports dynamic plugin platform names through `Platform("sendblue")` after the plugin registers itself.
