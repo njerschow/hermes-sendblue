@@ -15,8 +15,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _load_adapter():
     """Load adapter.py as a standalone module without hermes_cli/gateway installed."""
-    # adapter.py imports from `gateway.*`; stub those out so this test runs anywhere.
-    if "gateway" not in sys.modules:
+    # adapter.py imports from `gateway.*`. Prefer the real hermes-agent core when
+    # it's importable (e.g. running inside a hermes-agent checkout); otherwise stub
+    # gateway.* so this test still runs anywhere.
+    try:
+        import gateway.platforms.base  # noqa: F401
+
+        _real_core = True
+    except Exception:
+        _real_core = False
+
+    if not _real_core and "gateway" not in sys.modules:
         gateway_mod = type(sys)("gateway")
         config_mod = type(sys)("gateway.config")
         config_mod.Platform = lambda name: name  # type: ignore[attr-defined]
@@ -53,6 +62,11 @@ def _load_adapter():
 
         class _MessageType:
             TEXT = "text"
+            PHOTO = "photo"
+            VIDEO = "video"
+            AUDIO = "audio"
+            VOICE = "voice"
+            DOCUMENT = "document"
 
         base_mod.MessageType = _MessageType  # type: ignore[attr-defined]
 
@@ -60,6 +74,10 @@ def _load_adapter():
             pass
 
         base_mod.SendResult = _SendResult  # type: ignore[attr-defined]
+        base_mod.cache_image_from_bytes = lambda *a, **k: "/tmp/fake-image"  # type: ignore[attr-defined]
+        base_mod.cache_audio_from_bytes = lambda *a, **k: "/tmp/fake-audio"  # type: ignore[attr-defined]
+        base_mod.cache_video_from_bytes = lambda *a, **k: "/tmp/fake-video"  # type: ignore[attr-defined]
+        base_mod.cache_document_from_bytes = lambda *a, **k: "/tmp/fake-doc"  # type: ignore[attr-defined]
 
         sys.modules["gateway"] = gateway_mod
         sys.modules["gateway.config"] = config_mod
@@ -177,6 +195,47 @@ class UploadGuardTests(unittest.TestCase):
         with patch.object(client, "_raw_post_sync", side_effect=fake_post):
             with self.assertRaises(RuntimeError):
                 asyncio.run(client.upload_file_from_bytes("x.png", b"data"))
+
+
+class FormatMessageTests(unittest.TestCase):
+    """Outbound markdown stripping for the plain-text iMessage/SMS/RCS transport.
+
+    Mirrors the SMS/BlueBubbles/Photon convention (``format_message`` ->
+    ``strip_markdown``). Runs against whichever ``strip_markdown`` the adapter
+    loaded — the real core helper when present, else the local fallback, which
+    is regex-for-regex identical.
+    """
+
+    @staticmethod
+    def _fmt(text: str) -> str:
+        return adapter.SendblueAdapter.format_message(SimpleNamespace(), text)
+
+    def test_bold_and_italic_unwrapped(self) -> None:
+        self.assertEqual(self._fmt("**bold** and *italic*"), "bold and italic")
+
+    def test_headings_stripped(self) -> None:
+        self.assertEqual(self._fmt("# Title\nbody"), "Title\nbody")
+
+    def test_inline_code_unwrapped(self) -> None:
+        self.assertEqual(self._fmt("run `make test` now"), "run make test now")
+
+    def test_code_fence_removed_but_body_kept(self) -> None:
+        out = self._fmt("```python\nprint(1)\n```")
+        self.assertIn("print(1)", out)
+        self.assertNotIn("```", out)
+
+    def test_markdown_link_collapses_to_anchor_text(self) -> None:
+        # Documented lossy case shared with SMS/BlueBubbles/Photon: the URL drops.
+        self.assertEqual(self._fmt("see [the docs](https://x.com/a)"), "see the docs")
+
+    def test_raw_url_is_preserved(self) -> None:
+        self.assertEqual(self._fmt("see https://x.com/a"), "see https://x.com/a")
+
+    def test_plain_text_unchanged(self) -> None:
+        self.assertEqual(self._fmt("just a normal message"), "just a normal message")
+
+    def test_empty_is_safe(self) -> None:
+        self.assertEqual(self._fmt(""), "")
 
 
 if __name__ == "__main__":

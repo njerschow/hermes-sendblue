@@ -34,6 +34,36 @@ from gateway.platforms.base import (
     cache_video_from_bytes,
 )
 
+# strip_markdown was consolidated into gateway.platforms.helpers when the
+# per-adapter copies in sms.py/bluebubbles.py/feishu.py were de-duplicated.
+# Import it when present (current cores) but fall back to a local copy on
+# pre-consolidation cores, so a missing symbol can never disable the whole
+# plugin at import time (cf. the cache_media_bytes regression). The fallback
+# mirrors core's regexes exactly: code content is kept (only fences removed)
+# and markdown links collapse to their anchor text.
+try:
+    from gateway.platforms.helpers import strip_markdown
+except Exception:  # pragma: no cover - exercised only on very old cores
+    import re as _re
+
+    _MD_FALLBACK_PATTERNS = [
+        (_re.compile(r"\*\*(.+?)\*\*", _re.DOTALL), r"\1"),                       # bold
+        (_re.compile(r"\*(.+?)\*", _re.DOTALL), r"\1"),                           # italic *
+        (_re.compile(r"\b__(?![\s_])(.+?)(?<![\s_])__\b", _re.DOTALL), r"\1"),    # bold _
+        (_re.compile(r"\b_(?![\s_])(.+?)(?<![\s_])_\b", _re.DOTALL), r"\1"),      # italic _
+        (_re.compile(r"```[a-zA-Z0-9_+-]*\n?"), ""),                              # code fences (keep body)
+        (_re.compile(r"`(.+?)`"), r"\1"),                                         # inline code
+        (_re.compile(r"^#{1,6}\s+", _re.MULTILINE), ""),                          # ATX headings
+        (_re.compile(r"\[([^\]]+)\]\([^\)]+\)"), r"\1"),                          # links -> anchor text
+        (_re.compile(r"\n{3,}"), "\n\n"),                                         # collapse blank runs
+    ]
+
+    def strip_markdown(text: str) -> str:
+        text = str(text or "")
+        for pattern, repl in _MD_FALLBACK_PATTERNS:
+            text = pattern.sub(repl, text)
+        return text.strip()
+
 logger = logging.getLogger("gateway.platforms.sendblue")
 
 DEFAULT_API_BASE = "https://api.sendblue.com"
@@ -892,6 +922,15 @@ class SendblueAdapter(BasePlatformAdapter):
         )
         await self.handle_message(event)
 
+    def format_message(self, content: str) -> str:
+        """Strip markdown — iMessage/SMS/RCS render it as literal characters.
+
+        Mirrors the SMS, BlueBubbles, and Photon adapters: Sendblue is a
+        plain-text transport, so **bold**, headings, [links](url), and code
+        fences would otherwise reach the recipient as raw syntax.
+        """
+        return strip_markdown(content or "")
+
     async def send(
         self,
         chat_id: str,
@@ -906,7 +945,7 @@ class SendblueAdapter(BasePlatformAdapter):
 
         message_ids: List[str] = []
         try:
-            for chunk in _split_message(content):
+            for chunk in _split_message(self.format_message(content)):
                 message_ids.append(await self.client.send_message(target, chunk))
             if not message_ids:
                 return SendResult(success=False, error="Empty message")
@@ -946,7 +985,7 @@ class SendblueAdapter(BasePlatformAdapter):
 
         try:
             message_id = await self.client.send_message(
-                target, caption or "", media_url=media_url
+                target, self.format_message(caption or ""), media_url=media_url
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
@@ -1082,7 +1121,8 @@ async def _standalone_send(
 
     try:
         ids: List[str] = []
-        for chunk in _split_message(message):
+        # Strip markdown like the interactive send() path — Sendblue is plain text.
+        for chunk in _split_message(strip_markdown(message or "")):
             ids.append(await client.send_message(target, chunk))
 
         for media in media_files or []:
