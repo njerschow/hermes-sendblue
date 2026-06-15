@@ -14,3 +14,4 @@ venv/
 *.key
 *.pem
 .DS_Store
+scripts/

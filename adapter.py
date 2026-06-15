@@ -23,7 +23,16 @@ from typing import Any, Dict, List, Optional
 from urllib import error, parse, request
 
 from gateway.config import Platform
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    cache_audio_from_bytes,
+    cache_document_from_bytes,
+    cache_image_from_bytes,
+    cache_video_from_bytes,
+)
 
 logger = logging.getLogger("gateway.platforms.sendblue")
 
@@ -36,6 +45,85 @@ MAX_SENDBLUE_BODY_CHARS = 18_000
 MAX_WEBHOOK_BODY_BYTES = 1024 * 1024
 MIN_WEBHOOK_SECRET_CHARS = 16
 SENDBLUE_MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # Sendblue documented per-file limit
+SENDBLUE_MEDIA_DOWNLOAD_TIMEOUT = 30.0  # seconds; matches base.py URL-cache helpers
+SENDBLUE_MAX_INBOUND_MEDIA_BYTES = 25 * 1024 * 1024  # bound each inbound media download
+
+# Sendblue inbound messages carry no media-type metadata (only a bare media_url),
+# so we download the bytes and let _classify_and_cache() classify them, then map the
+# resulting kind to a Hermes MessageType. All audio -> VOICE (not AUDIO) so iMessage
+# voice notes are auto-transcribed; the tradeoff is that a plain audio clip is also
+# sent to STT, but Sendblue exposes no "is voice note" flag and silently dropping
+# real voice notes is the worse failure. This mirrors the BlueBubbles adapter.
+_KIND_TO_MESSAGE_TYPE = {
+    "image": MessageType.PHOTO,
+    "video": MessageType.VIDEO,
+    "audio": MessageType.VOICE,
+    "document": MessageType.DOCUMENT,
+}
+_KIND_TO_PLACEHOLDER = {
+    "image": "(image)",
+    "video": "(video)",
+    "audio": "(voice message)",
+    "document": "(attachment)",
+}
+
+# MIME / extension → kind classification for inbound media. The unified
+# cache_media_bytes() dispatcher only landed in core after May 2026 (and even on
+# current main its sole caller is telegram.py), so we classify here and route to
+# the long-stable per-kind cache_*_from_bytes helpers — the same ones every
+# bundled adapter (BlueBubbles, Photon, …) uses. Works on old and new cores.
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif", ".bmp", ".tiff"}
+_AUDIO_EXTS = {".mp3", ".m4a", ".ogg", ".wav", ".caf", ".aac", ".opus", ".flac", ".amr"}
+_VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".3gp"}
+_IMAGE_EXT_BY_MIME = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+    "image/webp": ".webp", "image/heic": ".jpg", "image/heif": ".jpg",
+    "image/tiff": ".jpg", "image/bmp": ".bmp",
+}
+_AUDIO_EXT_BY_MIME = {
+    "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mp4": ".m4a",
+    "audio/aac": ".m4a", "audio/ogg": ".ogg", "audio/wav": ".wav",
+    "audio/x-wav": ".wav", "audio/x-caf": ".caf", "audio/amr": ".amr",
+}
+_VIDEO_EXT_BY_MIME = {
+    "video/mp4": ".mp4", "video/quicktime": ".mov",
+    "video/webm": ".webm", "video/3gpp": ".3gp",
+}
+
+
+def _classify_and_cache(data: bytes, filename: str, mime: str) -> Optional[tuple]:
+    """Cache inbound media bytes locally; return (path, media_type, kind) or None.
+
+    Classifies by MIME prefix then file extension and routes to the per-kind
+    cache_*_from_bytes helpers. Returns None when the bytes can't be classified
+    (the caller then falls back to the ``[Media: <url>]`` marker). ``kind`` is one
+    of "image" / "audio" / "video" / "document".
+    """
+    mime = (mime or "").lower()
+    ext = os.path.splitext(filename or "")[1].lower()
+    try:
+        if mime.startswith("image/") or ext in _IMAGE_EXTS:
+            chosen = ext if ext in _IMAGE_EXTS else _IMAGE_EXT_BY_MIME.get(mime, ".jpg")
+            try:
+                return cache_image_from_bytes(data, chosen), mime or "image/jpeg", "image"
+            except ValueError:
+                return None  # claimed to be an image but the bytes aren't one
+        if mime.startswith("audio/") or ext in _AUDIO_EXTS:
+            chosen = ext if ext in _AUDIO_EXTS else _AUDIO_EXT_BY_MIME.get(mime, ".ogg")
+            return cache_audio_from_bytes(data, chosen), mime or "audio/mpeg", "audio"
+        if mime.startswith("video/") or ext in _VIDEO_EXTS:
+            chosen = ext if ext in _VIDEO_EXTS else _VIDEO_EXT_BY_MIME.get(mime, ".mp4")
+            return cache_video_from_bytes(data, chosen), mime or "video/mp4", "video"
+        if ext:
+            # A named file of some other type → treat as a document.
+            return cache_document_from_bytes(data, filename), mime or "application/octet-stream", "document"
+        # No MIME and no extension: last-resort image sniff (validates magic bytes).
+        try:
+            return cache_image_from_bytes(data, ".jpg"), "image/jpeg", "image"
+        except ValueError:
+            return None
+    except Exception:
+        return None
 
 
 def _is_truthy(value: Any) -> bool:
@@ -415,6 +503,51 @@ class SendblueClient:
         data = await asyncio.to_thread(path.read_bytes)
         return await self.upload_file_from_bytes(path.name, data)
 
+    def _download_media_sync(
+        self, media_url: str, *, authenticated: bool = False
+    ) -> tuple[bytes, str]:
+        # Sendblue CDN media URLs are always HTTPS. Requiring https blocks
+        # file://, ftp://, etc. We deliberately skip a full SSRF/DNS check
+        # (is_safe_url lives in tools.url_safety, outside gateway.platforms.base):
+        # the URL comes from Sendblue's own API response, not user free-text, and a
+        # per-poll DNS resolution is avoidable overhead. https-only is the pragmatic
+        # guard for a platform plugin.
+        parsed = parse.urlparse(media_url)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise RuntimeError(f"Refusing non-HTTPS media URL: {media_url}")
+
+        # The download targets the CDN host, not api.sendblue.com, so by default we
+        # do NOT send sb-api-key credentials (avoid leaking them to the CDN). Flip
+        # `authenticated` if Sendblue's CDN is ever found to require auth.
+        if authenticated:
+            headers = self._headers(content_type=None)
+        else:
+            headers = {"User-Agent": DEFAULT_USER_AGENT, "Accept": "*/*"}
+
+        req = request.Request(media_url, headers=headers, method="GET")
+        try:
+            with request.urlopen(req, timeout=SENDBLUE_MEDIA_DOWNLOAD_TIMEOUT) as resp:
+                # Read one byte past the cap so an oversized file is detectable.
+                data = resp.read(SENDBLUE_MAX_INBOUND_MEDIA_BYTES + 1)
+                if len(data) > SENDBLUE_MAX_INBOUND_MEDIA_BYTES:
+                    raise RuntimeError(
+                        f"Inbound media exceeds {SENDBLUE_MAX_INBOUND_MEDIA_BYTES} bytes"
+                    )
+                content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0]
+                return data, content_type.strip().lower()
+        except error.HTTPError as exc:
+            raise RuntimeError(f"Sendblue media download error {exc.code}") from exc
+        except error.URLError as exc:
+            raise RuntimeError(f"Sendblue media download connection error: {exc}") from exc
+
+    async def download_media(
+        self, media_url: str, *, authenticated: bool = False
+    ) -> tuple[bytes, str]:
+        """Download inbound media bytes; return (data, lowercased content-type)."""
+        return await asyncio.to_thread(
+            self._download_media_sync, media_url, authenticated=authenticated
+        )
+
 
 class ProcessedMessageStore:
     def __init__(self, path: Path):
@@ -687,10 +820,44 @@ class SendblueAdapter(BasePlatformAdapter):
 
         content = str(message.get("content") or "").strip()
         media_url = str(message.get("media_url") or "").strip()
+
         text = content
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        message_type = MessageType.TEXT
+
         if media_url:
-            media_line = f"[Media: {media_url}]"
-            text = f"{content}\n\n{media_line}" if content else media_line
+            # Download + cache the attachment so the gateway can attach images to
+            # the model's vision input and route voice notes to STT. On any failure
+            # (download error, oversize, or an unclassifiable type) fall back to the
+            # plain [Media: <url>] marker so the message is never lost.
+            try:
+                data, content_type = await self.client.download_media(media_url)
+                filename = parse.unquote(os.path.basename(parse.urlparse(media_url).path))
+                cached = _classify_and_cache(data, filename, content_type)
+                if cached is None:
+                    raise RuntimeError(
+                        f"unclassifiable media (content-type={content_type or 'unknown'})"
+                    )
+                cached_path, cached_mime, cached_kind = cached
+                media_urls.append(cached_path)
+                media_types.append(cached_mime)
+                message_type = _KIND_TO_MESSAGE_TYPE.get(cached_kind, MessageType.DOCUMENT)
+                if not content:
+                    text = _KIND_TO_PLACEHOLDER.get(cached_kind, "(attachment)")
+            except Exception as exc:
+                logger.warning(
+                    "Sendblue media handling failed for %s; falling back to link: %s",
+                    message_id[-8:],
+                    exc,
+                )
+                media_urls = []
+                media_types = []
+                message_type = MessageType.TEXT
+                text = (
+                    f"{content}\n\n[Media: {media_url}]" if content else f"[Media: {media_url}]"
+                )
+
         if not text:
             return
 
@@ -710,13 +877,15 @@ class SendblueAdapter(BasePlatformAdapter):
         )
         event = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT,
+            message_type=message_type,
             source=source,
+            media_urls=media_urls,
+            media_types=media_types,
             raw_message={
                 "message_handle": message_id,
                 "service": message.get("service"),
                 "message_type": message.get("message_type"),
-                "has_media": bool(media_url),
+                "has_media": bool(media_urls),
             },
             message_id=message_id,
             timestamp=_parse_datetime(message.get("date_sent") or message.get("date_created")),
