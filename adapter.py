@@ -183,6 +183,24 @@ def _normalize_phone(value: str) -> str:
     return f"+{digits}" if digits else raw
 
 
+def _normalize_group_chat_id(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.startswith("sendblue:group:"):
+        text = text[len("sendblue:group:"):]
+    elif text.startswith("group:"):
+        text = text[len("group:"):]
+    return text.strip()
+
+
+def _group_chat_id(group_id: str) -> str:
+    return f"sendblue:group:{_normalize_group_chat_id(group_id)}"
+
+
+def _is_group_chat_id(value: Any) -> bool:
+    text = str(value or "").strip()
+    return text.startswith("sendblue:group:") or text.startswith("group:")
+
+
 def _redacted_phone(value: str) -> str:
     normalized = _normalize_phone(value)
     if len(normalized) <= 5:
@@ -459,6 +477,58 @@ class SendblueClient:
             body=body,
         )
         return str(payload.get("message_handle") or payload.get("id") or int(time.time() * 1000))
+
+    async def send_group_message(
+        self,
+        *,
+        group_id: str = "",
+        numbers: Optional[List[str]] = None,
+        content: str = "",
+        media_url: str = "",
+    ) -> str:
+        normalized_group_id = _normalize_group_chat_id(group_id)
+        normalized_numbers = [_normalize_phone(number) for number in numbers or [] if _normalize_phone(number)]
+        body: Dict[str, Any] = {
+            "from_number": self.settings.phone_number,
+        }
+        if normalized_group_id:
+            body["group_id"] = normalized_group_id
+        elif normalized_numbers:
+            body["numbers"] = normalized_numbers
+        else:
+            raise ValueError("Sendblue group message requires group_id or numbers")
+        if content:
+            body["content"] = content
+        if media_url:
+            body["media_url"] = media_url
+        if not body.get("content") and not body.get("media_url"):
+            raise ValueError("Sendblue group message requires content or media_url")
+
+        payload = await asyncio.to_thread(
+            self._json_request_sync,
+            "POST",
+            "/api/send-group-message",
+            body=body,
+        )
+        return str(payload.get("message_handle") or payload.get("id") or int(time.time() * 1000))
+
+    async def add_recipient_to_group(self, group_id: str, number: str) -> Dict[str, Any]:
+        normalized_group_id = _normalize_group_chat_id(group_id)
+        normalized_number = _normalize_phone(number)
+        if not normalized_group_id:
+            raise ValueError("Sendblue modify-group requires group_id")
+        if not normalized_number:
+            raise ValueError("Sendblue modify-group requires add_recipient")
+
+        return await asyncio.to_thread(
+            self._json_request_sync,
+            "POST",
+            "/api/modify-group",
+            body={
+                "group_id": normalized_group_id,
+                "add_recipient": normalized_number,
+            },
+        )
 
     async def send_typing_indicator(self, to_number: str) -> None:
         body = {
@@ -850,6 +920,7 @@ class SendblueAdapter(BasePlatformAdapter):
 
         content = str(message.get("content") or "").strip()
         media_url = str(message.get("media_url") or "").strip()
+        group_id = _normalize_group_chat_id(message.get("group_id"))
 
         text = content
         media_urls: List[str] = []
@@ -897,10 +968,13 @@ class SendblueAdapter(BasePlatformAdapter):
             except Exception:
                 logger.debug("Sendblue mark-read failed", exc_info=True)
 
+        chat_id = _group_chat_id(group_id) if group_id else from_number
         source = self.build_source(
-            chat_id=from_number,
-            chat_name=f"Sendblue contact {_redacted_phone(from_number)}",
-            chat_type="dm",
+            chat_id=chat_id,
+            chat_name=(
+                f"Sendblue group {group_id}" if group_id else f"Sendblue contact {_redacted_phone(from_number)}"
+            ),
+            chat_type="group" if group_id else "dm",
             user_id=from_number,
             user_name=f"Sendblue contact {_redacted_phone(from_number)}",
             message_id=message_id,
@@ -915,6 +989,8 @@ class SendblueAdapter(BasePlatformAdapter):
                 "message_handle": message_id,
                 "service": message.get("service"),
                 "message_type": message.get("message_type"),
+                "group_id": group_id or None,
+                "from_number": from_number,
                 "has_media": bool(media_urls),
             },
             message_id=message_id,
@@ -939,14 +1015,18 @@ class SendblueAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         del reply_to, metadata
-        target = _normalize_phone(chat_id)
-        if not target:
+        group_id = _normalize_group_chat_id(chat_id) if _is_group_chat_id(chat_id) else ""
+        target = "" if group_id else _normalize_phone(chat_id)
+        if not group_id and not target:
             return SendResult(success=False, error="Missing destination phone number")
 
         message_ids: List[str] = []
         try:
             for chunk in _split_message(self.format_message(content)):
-                message_ids.append(await self.client.send_message(target, chunk))
+                if group_id:
+                    message_ids.append(await self.client.send_group_message(group_id=group_id, content=chunk))
+                else:
+                    message_ids.append(await self.client.send_message(target, chunk))
             if not message_ids:
                 return SendResult(success=False, error="Empty message")
             return SendResult(success=True, message_id=",".join(message_ids))
@@ -967,8 +1047,9 @@ class SendblueAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
     ) -> SendResult:
         """Upload a local file (or pass through a URL) and send it as a Sendblue attachment."""
-        target = _normalize_phone(chat_id)
-        if not target:
+        group_id = _normalize_group_chat_id(chat_id) if _is_group_chat_id(chat_id) else ""
+        target = "" if group_id else _normalize_phone(chat_id)
+        if not group_id and not target:
             return SendResult(success=False, error="Missing destination phone number")
         if not media:
             return SendResult(success=False, error="Missing media path or URL")
@@ -984,9 +1065,16 @@ class SendblueAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=str(exc), retryable=True)
 
         try:
-            message_id = await self.client.send_message(
-                target, self.format_message(caption or ""), media_url=media_url
-            )
+            if group_id:
+                message_id = await self.client.send_group_message(
+                    group_id=group_id,
+                    content=self.format_message(caption or ""),
+                    media_url=media_url,
+                )
+            else:
+                message_id = await self.client.send_message(
+                    target, self.format_message(caption or ""), media_url=media_url
+                )
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             return SendResult(success=False, error=str(exc), retryable=True)
@@ -1052,6 +1140,9 @@ class SendblueAdapter(BasePlatformAdapter):
         return await self._attach_local_or_remote(chat_id, audio_path, caption)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        if _is_group_chat_id(chat_id):
+            group_id = _normalize_group_chat_id(chat_id)
+            return {"name": f"Sendblue group {group_id}", "type": "group", "group_id": group_id}
         phone = _normalize_phone(chat_id)
         return {"name": phone, "type": "dm"}
 

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -195,6 +197,152 @@ class UploadGuardTests(unittest.TestCase):
         with patch.object(client, "_raw_post_sync", side_effect=fake_post):
             with self.assertRaises(RuntimeError):
                 asyncio.run(client.upload_file_from_bytes("x.png", b"data"))
+
+
+class GroupCompatibilityTests(unittest.TestCase):
+    def _client(self) -> "adapter.SendblueClient":
+        settings = adapter.SendblueSettings(
+            api_key="k",
+            api_secret="s",
+            phone_number="+15550000000",
+        )
+        return adapter.SendblueClient(settings)
+
+    def test_group_send_posts_existing_group_id(self) -> None:
+        client = self._client()
+        captured: dict = {}
+
+        def fake_json(method, path, *, query=None, body=None):
+            captured["method"] = method
+            captured["path"] = path
+            captured["query"] = query
+            captured["body"] = body
+            return {"message_handle": "group-msg-1"}
+
+        with patch.object(client, "_json_request_sync", side_effect=fake_json):
+            message_id = asyncio.run(
+                client.send_group_message(group_id="sendblue:group:group-1", content="hello")
+            )
+
+        self.assertEqual(message_id, "group-msg-1")
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["path"], "/api/send-group-message")
+        self.assertEqual(
+            captured["body"],
+            {
+                "from_number": "+15550000000",
+                "group_id": "group-1",
+                "content": "hello",
+            },
+        )
+
+    def test_group_send_can_create_from_numbers(self) -> None:
+        client = self._client()
+        captured: dict = {}
+
+        def fake_json(method, path, *, query=None, body=None):
+            captured["path"] = path
+            captured["body"] = body
+            return {"id": "group-msg-2"}
+
+        with patch.object(client, "_json_request_sync", side_effect=fake_json):
+            message_id = asyncio.run(
+                client.send_group_message(
+                    numbers=["555-000-0001", "+15550000002"],
+                    content="hello group",
+                )
+            )
+
+        self.assertEqual(message_id, "group-msg-2")
+        self.assertEqual(captured["path"], "/api/send-group-message")
+        self.assertEqual(captured["body"]["numbers"], ["+15550000001", "+15550000002"])
+
+    def test_modify_group_add_recipient_posts_documented_shape(self) -> None:
+        client = self._client()
+        captured: dict = {}
+
+        def fake_json(method, path, *, query=None, body=None):
+            captured["method"] = method
+            captured["path"] = path
+            captured["body"] = body
+            return {"status": "OK"}
+
+        with patch.object(client, "_json_request_sync", side_effect=fake_json):
+            result = asyncio.run(client.add_recipient_to_group("group:group-1", "555-000-0003"))
+
+        self.assertEqual(result, {"status": "OK"})
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["path"], "/api/modify-group")
+        self.assertEqual(captured["body"], {"group_id": "group-1", "add_recipient": "+15550000003"})
+
+    def test_adapter_send_routes_group_chat_ids_to_group_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(os.environ, {"HERMES_HOME": tmpdir}):
+            sendblue = adapter.SendblueAdapter(
+                SimpleNamespace(
+                    extra={
+                        "api_key": "k",
+                        "api_secret": "s",
+                        "phone_number": "+15550000000",
+                    }
+                )
+            )
+            sendblue.client.send_group_message = _async_returning("group-msg-3")
+            result = asyncio.run(sendblue.send("sendblue:group:group-1", "**hello** group"))
+            asyncio.run(sendblue.disconnect())
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "group-msg-3")
+        sendblue.client.send_group_message.assert_awaited_once_with(
+            group_id="group-1",
+            content="hello group",
+        )
+
+    def test_inbound_group_id_becomes_group_chat_source_and_raw_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(os.environ, {"HERMES_HOME": tmpdir}):
+            sendblue = adapter.SendblueAdapter(
+                SimpleNamespace(
+                    extra={
+                        "api_key": "k",
+                        "api_secret": "s",
+                        "phone_number": "+15550000000",
+                    }
+                )
+            )
+            seen = []
+
+            async def capture(event):
+                seen.append(event)
+
+            sendblue.handle_message = capture
+            asyncio.run(
+                sendblue._handle_sendblue_message(
+                    {
+                        "message_handle": "inbound-group-msg",
+                        "from_number": "+15550000001",
+                        "sendblue_number": "+15550000000",
+                        "group_id": "group-1",
+                        "content": "mapping fixed",
+                        "date_sent": "2026-06-27T17:00:00Z",
+                    }
+                )
+            )
+            asyncio.run(sendblue.disconnect())
+
+        self.assertEqual(len(seen), 1)
+        event = seen[0]
+        self.assertEqual(event.source["chat_id"], "sendblue:group:group-1")
+        self.assertEqual(event.source["chat_type"], "group")
+        self.assertEqual(event.source["user_id"], "+15550000001")
+        self.assertEqual(event.raw_message["message_handle"], "inbound-group-msg")
+        self.assertEqual(event.raw_message["group_id"], "group-1")
+        self.assertEqual(event.raw_message["from_number"], "+15550000001")
+
+
+def _async_returning(value):
+    async def _inner(*args, **kwargs):
+        return value
+
+    return AsyncMock(side_effect=_inner)
 
 
 class FormatMessageTests(unittest.TestCase):
