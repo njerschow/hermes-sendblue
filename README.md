@@ -14,6 +14,7 @@ This is the Hermes Agent version of `openclaw-sendblue`: a third-party Hermes pl
 - Cron/notification delivery with `deliver=sendblue` and `SENDBLUE_HOME_CHANNEL`
 - Public CDN-style image URL delivery as Sendblue media attachments
 - Local file attachments uploaded automatically via Sendblue's `/api/upload-file` (max 100 MB)
+- Existing Sendblue group conversations via `sendblue:group:<group_id>` chat IDs, including inbound `group_id` metadata for reply correlation
 
 ## Quick Start
 
@@ -93,6 +94,26 @@ hermes gateway restart
 ```
 
 Text your Sendblue number from a phone listed in `SENDBLUE_ALLOWED_USERS`. Hermes should reply in the same thread.
+
+## Group Conversations
+
+Sendblue group messages are available on select plans and have an important constraint for AI Agent lines: the line can respond to a group only after the group already exists. For Hermes, use the Sendblue `group_id` as the chat ID:
+
+```text
+sendblue:group:<group_id>
+```
+
+Outbound sends to that chat ID call Sendblue's `POST /api/send-group-message` with `group_id`. Inbound group messages from polling or webhooks keep the same stable chat ID and expose the correlation anchors in `raw_message`:
+
+```json
+{
+  "message_handle": "msg_...",
+  "group_id": "group_...",
+  "from_number": "+15550101001"
+}
+```
+
+Those fields are the safe primitives other systems should use for reply correlation and responder identity. Do not infer a responder from display names or message text.
 
 ## Access Control
 
