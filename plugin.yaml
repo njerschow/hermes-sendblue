@@ -29,8 +29,16 @@ optional_env:
     prompt: "Allow all users? (true/false)"
     password: false
   - name: SENDBLUE_HOME_CHANNEL
-    description: "Default phone number for `deliver=sendblue` cron jobs and notifications."
-    prompt: "Default delivery phone"
+    description: "Default phone number or Sendblue group_id for `deliver=sendblue` cron jobs and notifications."
+    prompt: "Default delivery phone or group"
+    password: false
+  - name: SENDBLUE_REQUIRE_MENTION
+    description: "Fallback for config.yaml require_mention. Require a wake-word before replying in group chats (true/false). Default: false; DMs are never gated."
+    prompt: "Require wake-word in groups? (true/false)"
+    password: false
+  - name: SENDBLUE_MENTION_PATTERNS
+    description: "Fallback for config.yaml mention_patterns. Comma-separated (or JSON list of) regex wake-words for group replies. Defaults match 'hermes agent' and 'hermes'."
+    prompt: "Group wake-word patterns"
     password: false
   - name: SENDBLUE_POLL_INTERVAL_SECONDS
     description: "Polling interval for inbound messages when webhook mode is disabled. Default: 5."

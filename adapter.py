@@ -12,6 +12,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -77,6 +78,15 @@ MIN_WEBHOOK_SECRET_CHARS = 16
 SENDBLUE_MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # Sendblue documented per-file limit
 SENDBLUE_MEDIA_DOWNLOAD_TIMEOUT = 30.0  # seconds; matches base.py URL-cache helpers
 SENDBLUE_MAX_INBOUND_MEDIA_BYTES = 25 * 1024 * 1024  # bound each inbound media download
+GROUP_ID_MAX_LENGTH = 160
+GROUP_ID_ALLOWED_CHARS_PATTERN = re.compile(r"^[A-Za-z0-9+@._:-]+$")
+
+# Sendblue/iMessage has no stable @identity for the bot. Keep the same default
+# wake words as Hermes' BlueBubbles and Photon adapters.
+_DEFAULT_MENTION_PATTERNS = [
+    r"(?<![\w@])@?hermes\s+agent\b[,:\-]?",
+    r"(?<![\w@])@?hermes\b[,:\-]?",
+]
 
 # Sendblue inbound messages carry no media-type metadata (only a bare media_url),
 # so we download the bytes and let _classify_and_cache() classify them, then map the
@@ -168,6 +178,21 @@ def _env_first(*names: str) -> str:
     return ""
 
 
+def _has_group_chat_id_marker(value: Any) -> bool:
+    text = str(value or "").strip()
+    return text.startswith("sb_group_") or "_group_id_" in text
+
+
+def _is_group_chat_id(value: Any) -> bool:
+    """Return whether *value* matches Sendblue's public group-id contract."""
+    text = str(value or "").strip()
+    if not text or len(text) > GROUP_ID_MAX_LENGTH:
+        return False
+    if not GROUP_ID_ALLOWED_CHARS_PATTERN.fullmatch(text):
+        return False
+    return _has_group_chat_id_marker(text)
+
+
 def _normalize_phone(value: str) -> str:
     """Normalize common phone input to E.164-ish form without guessing country."""
     raw = str(value or "").strip()
@@ -181,6 +206,67 @@ def _normalize_phone(value: str) -> str:
     if len(digits) == 10:
         return f"+1{digits}"
     return f"+{digits}" if digits else raw
+
+
+def _resolve_message_target(value: Any) -> tuple[str, str]:
+    """Resolve a Hermes chat id to (``group``|``dm``, Sendblue target)."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "dm", ""
+    if _has_group_chat_id_marker(raw):
+        if not _is_group_chat_id(raw):
+            raise ValueError("Invalid Sendblue group id")
+        return "group", raw
+    return "dm", _normalize_phone(raw)
+
+
+def _compile_mention_patterns(raw: Any) -> List[re.Pattern[str]]:
+    """Compile group wake words from config or the environment."""
+    if raw is None:
+        patterns: List[Any] = list(_DEFAULT_MENTION_PATTERNS)
+    elif isinstance(raw, str):
+        text = raw.strip()
+        try:
+            loaded = json.loads(text)
+        except Exception:
+            loaded = None
+        patterns = loaded if isinstance(loaded, list) else [
+            part.strip()
+            for line in text.splitlines()
+            for part in line.split(",")
+        ]
+    elif isinstance(raw, list):
+        patterns = raw
+    else:
+        patterns = [raw]
+
+    compiled: List[re.Pattern[str]] = []
+    for pattern in patterns:
+        text = str(pattern).strip()
+        if not text:
+            continue
+        try:
+            compiled.append(re.compile(text, re.IGNORECASE))
+        except re.error as exc:
+            logger.warning("Sendblue: invalid mention pattern %r: %s", text, exc)
+    return compiled
+
+
+def _message_matches_mention_patterns(text: str, patterns: List[re.Pattern[str]]) -> bool:
+    return bool(text and patterns and any(pattern.search(text) for pattern in patterns))
+
+
+def _clean_mention_text(text: str, patterns: List[re.Pattern[str]]) -> str:
+    """Strip a leading wake word without deleting ordinary later matches."""
+    if not text:
+        return text
+    stripped = text.lstrip()
+    for pattern in patterns:
+        match = pattern.match(stripped)
+        if match:
+            cleaned = stripped[match.end():].lstrip(" ,:-")
+            return cleaned or text
+    return text
 
 
 def _redacted_phone(value: str) -> str:
@@ -282,6 +368,8 @@ class SendblueSettings:
     webhook_port: int = 3141
     webhook_path: str = "/webhook/sendblue"
     webhook_secret: str = ""
+    require_mention: bool = False
+    mention_patterns_raw: Any = None
 
 
 def _settings_from_config(config: Any) -> SendblueSettings:
@@ -312,6 +400,16 @@ def _settings_from_config(config: Any) -> SendblueSettings:
     lookback = os.getenv("SENDBLUE_STARTUP_LOOKBACK_SECONDS") or extra.get("startup_lookback_seconds")
     limit = os.getenv("SENDBLUE_MESSAGE_LIMIT") or extra.get("message_limit")
     webhook = extra.get("webhook", {}) if isinstance(extra.get("webhook"), dict) else {}
+    # Match BlueBubbles and Photon: behavioral config wins when explicitly
+    # present, with environment variables retained as compatibility fallbacks.
+    require_mention_raw = extra.get("require_mention")
+    if require_mention_raw is None:
+        require_mention_raw = os.getenv("SENDBLUE_REQUIRE_MENTION")
+    mention_patterns_raw: Any = (
+        extra["mention_patterns"]
+        if "mention_patterns" in extra
+        else os.getenv("SENDBLUE_MENTION_PATTERNS")
+    )
 
     return SendblueSettings(
         api_key=str(api_key).strip(),
@@ -351,6 +449,8 @@ def _settings_from_config(config: Any) -> SendblueSettings:
             or extra.get("webhook_secret")
             or ""
         ),
+        require_mention=_is_truthy(require_mention_raw),
+        mention_patterns_raw=mention_patterns_raw,
     )
 
 
@@ -434,17 +534,15 @@ class SendblueClient:
         messages.sort(key=lambda msg: _parse_datetime(msg.get("date_sent") or msg.get("date_created")))
         return messages
 
-    async def send_message(
+    async def _send_one(
         self,
-        to_number: str,
-        content: str = "",
-        *,
-        media_url: str = "",
+        target: Dict[str, Any],
+        path: str,
+        content: str,
+        media_url: str,
     ) -> str:
-        body: Dict[str, Any] = {
-            "number": _normalize_phone(to_number),
-            "from_number": self.settings.phone_number,
-        }
+        body = dict(target)
+        body["from_number"] = self.settings.phone_number
         if content:
             body["content"] = content
         if media_url:
@@ -455,10 +553,41 @@ class SendblueClient:
         payload = await asyncio.to_thread(
             self._json_request_sync,
             "POST",
-            "/api/send-message",
+            path,
             body=body,
         )
         return str(payload.get("message_handle") or payload.get("id") or int(time.time() * 1000))
+
+    async def send_message(
+        self,
+        to_number: str,
+        content: str = "",
+        *,
+        media_url: str = "",
+    ) -> str:
+        return await self._send_one(
+            {"number": _normalize_phone(to_number)},
+            "/api/send-message",
+            content,
+            media_url,
+        )
+
+    async def send_group_message(
+        self,
+        group_id: str,
+        content: str = "",
+        *,
+        media_url: str = "",
+    ) -> str:
+        target = str(group_id or "").strip()
+        if not _is_group_chat_id(target):
+            raise ValueError("Invalid Sendblue group id")
+        return await self._send_one(
+            {"group_id": target},
+            "/api/send-group-message",
+            content,
+            media_url,
+        )
 
     async def send_typing_indicator(self, to_number: str) -> None:
         body = {
@@ -720,6 +849,7 @@ class SendblueAdapter(BasePlatformAdapter):
         )
         state_path = _hermes_home() / "platforms" / "sendblue" / "processed.sqlite3"
         self._store = ProcessedMessageStore(state_path)
+        self._mention_patterns = _compile_mention_patterns(self.settings.mention_patterns_raw)
 
     @property
     def name(self) -> str:
@@ -891,20 +1021,57 @@ class SendblueAdapter(BasePlatformAdapter):
         if not text:
             return
 
-        if self.settings.mark_read:
+        group_id = str(message.get("group_id") or "").strip()
+        declared_group = str(message.get("message_type") or "").strip().lower() == "group"
+        if declared_group and not group_id:
+            logger.warning(
+                "Dropping Sendblue group message %s with no group_id",
+                message_id[-8:],
+            )
+            return
+        if group_id and not _is_group_chat_id(group_id):
+            logger.warning(
+                "Dropping Sendblue message %s with invalid group_id",
+                message_id[-8:],
+            )
+            return
+
+        is_group = bool(group_id)
+        if is_group and self.settings.require_mention:
+            if not _message_matches_mention_patterns(text, self._mention_patterns):
+                logger.debug(
+                    "Sendblue: ignoring group message "
+                    "(require_mention=true, no mention pattern matched)"
+                )
+                return
+            text = _clean_mention_text(text, self._mention_patterns)
+
+        # Sendblue's typing/read endpoints accept a phone number, not a group id.
+        if self.settings.mark_read and not is_group:
             try:
                 await self.client.mark_read(from_number)
             except Exception:
                 logger.debug("Sendblue mark-read failed", exc_info=True)
 
-        source = self.build_source(
-            chat_id=from_number,
-            chat_name=f"Sendblue contact {_redacted_phone(from_number)}",
-            chat_type="dm",
-            user_id=from_number,
-            user_name=f"Sendblue contact {_redacted_phone(from_number)}",
-            message_id=message_id,
-        )
+        if is_group:
+            display_name = str(message.get("group_display_name") or "").strip()
+            source = self.build_source(
+                chat_id=group_id,
+                chat_name=display_name or f"Sendblue group {group_id[-6:]}",
+                chat_type="group",
+                user_id=from_number,
+                user_name=f"Sendblue contact {_redacted_phone(from_number)}",
+                message_id=message_id,
+            )
+        else:
+            source = self.build_source(
+                chat_id=from_number,
+                chat_name=f"Sendblue contact {_redacted_phone(from_number)}",
+                chat_type="dm",
+                user_id=from_number,
+                user_name=f"Sendblue contact {_redacted_phone(from_number)}",
+                message_id=message_id,
+            )
         event = MessageEvent(
             text=text,
             message_type=message_type,
@@ -915,6 +1082,7 @@ class SendblueAdapter(BasePlatformAdapter):
                 "message_handle": message_id,
                 "service": message.get("service"),
                 "message_type": message.get("message_type"),
+                "group_id": group_id or None,
                 "has_media": bool(media_urls),
             },
             message_id=message_id,
@@ -931,6 +1099,21 @@ class SendblueAdapter(BasePlatformAdapter):
         """
         return strip_markdown(content or "")
 
+    def _resolve_target(self, chat_id: str) -> tuple[str, str]:
+        return _resolve_message_target(chat_id)
+
+    async def _send_chunk(
+        self,
+        kind: str,
+        target: str,
+        content: str = "",
+        *,
+        media_url: str = "",
+    ) -> str:
+        if kind == "group":
+            return await self.client.send_group_message(target, content, media_url=media_url)
+        return await self.client.send_message(target, content, media_url=media_url)
+
     async def send(
         self,
         chat_id: str,
@@ -939,24 +1122,28 @@ class SendblueAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         del reply_to, metadata
-        target = _normalize_phone(chat_id)
-        if not target:
-            return SendResult(success=False, error="Missing destination phone number")
-
         message_ids: List[str] = []
         try:
+            kind, target = self._resolve_target(chat_id)
+            if not target:
+                return SendResult(success=False, error="Missing destination phone number or group id")
             for chunk in _split_message(self.format_message(content)):
-                message_ids.append(await self.client.send_message(target, chunk))
+                message_ids.append(await self._send_chunk(kind, target, chunk))
             if not message_ids:
                 return SendResult(success=False, error="Empty message")
             return SendResult(success=True, message_id=",".join(message_ids))
+        except ValueError as exc:
+            return SendResult(success=False, error=str(exc), retryable=False)
         except Exception as exc:
             return SendResult(success=False, error=str(exc), retryable=True)
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         del metadata
         try:
-            await self.client.send_typing_indicator(chat_id)
+            kind, target = self._resolve_target(chat_id)
+            if kind == "group" or not target:
+                return
+            await self.client.send_typing_indicator(target)
         except Exception:
             logger.debug("Sendblue typing indicator failed", exc_info=True)
 
@@ -967,11 +1154,15 @@ class SendblueAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
     ) -> SendResult:
         """Upload a local file (or pass through a URL) and send it as a Sendblue attachment."""
-        target = _normalize_phone(chat_id)
-        if not target:
-            return SendResult(success=False, error="Missing destination phone number")
         if not media:
             return SendResult(success=False, error="Missing media path or URL")
+
+        try:
+            kind, target = self._resolve_target(chat_id)
+        except ValueError as exc:
+            return SendResult(success=False, error=str(exc), retryable=False)
+        if not target:
+            return SendResult(success=False, error="Missing destination phone number or group id")
 
         media_url = media
         if _is_local_media(media):
@@ -984,8 +1175,8 @@ class SendblueAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=str(exc), retryable=True)
 
         try:
-            message_id = await self.client.send_message(
-                target, self.format_message(caption or ""), media_url=media_url
+            message_id = await self._send_chunk(
+                kind, target, self.format_message(caption or ""), media_url=media_url
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
@@ -1052,8 +1243,10 @@ class SendblueAdapter(BasePlatformAdapter):
         return await self._attach_local_or_remote(chat_id, audio_path, caption)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        phone = _normalize_phone(chat_id)
-        return {"name": phone, "type": "dm"}
+        kind, target = self._resolve_target(chat_id)
+        if kind == "group":
+            return {"name": f"Sendblue group {target[-6:]}", "type": "group", "id": target}
+        return {"name": target, "type": "dm", "id": target}
 
 
 def check_requirements() -> bool:
@@ -1085,8 +1278,12 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
 
     home = _env_first("SENDBLUE_HOME_CHANNEL", "SENDBLUE_HOME_PHONE")
     if home:
-        home_phone = _normalize_phone(home)
-        seed["home_channel"] = {"chat_id": home_phone, "name": home_phone}
+        try:
+            _, home_target = _resolve_message_target(home)
+        except ValueError:
+            logger.warning("Ignoring invalid SENDBLUE_HOME_CHANNEL group id")
+        else:
+            seed["home_channel"] = {"chat_id": home_target, "name": home_target}
 
     if settings.webhook_enabled:
         seed["webhook"] = {
@@ -1114,16 +1311,23 @@ async def _standalone_send(
     if not (settings.api_key and settings.api_secret and settings.phone_number):
         return {"error": "Sendblue standalone send: missing SENDBLUE_API_KEY, SENDBLUE_API_SECRET, or SENDBLUE_PHONE_NUMBER"}
 
-    client = SendblueClient(settings)
-    target = _normalize_phone(chat_id or _env_first("SENDBLUE_HOME_CHANNEL", "SENDBLUE_HOME_PHONE"))
-    if not target:
-        return {"error": "Sendblue standalone send: missing chat_id or SENDBLUE_HOME_CHANNEL"}
-
     try:
+        client = SendblueClient(settings)
+        kind, target = _resolve_message_target(
+            chat_id or _env_first("SENDBLUE_HOME_CHANNEL", "SENDBLUE_HOME_PHONE")
+        )
+        if not target:
+            return {"error": "Sendblue standalone send: missing chat_id or SENDBLUE_HOME_CHANNEL"}
+
+        async def send_target(content: str = "", *, media_url: str = "") -> str:
+            if kind == "group":
+                return await client.send_group_message(target, content, media_url=media_url)
+            return await client.send_message(target, content, media_url=media_url)
+
         ids: List[str] = []
         # Strip markdown like the interactive send() path — Sendblue is plain text.
         for chunk in _split_message(strip_markdown(message or "")):
-            ids.append(await client.send_message(target, chunk))
+            ids.append(await send_target(chunk))
 
         for media in media_files or []:
             media_str = str(media)
@@ -1136,9 +1340,9 @@ async def _standalone_send(
                             f"Sendblue standalone send failed to upload {media_str}: {exc}"
                         )
                     }
-                ids.append(await client.send_message(target, "", media_url=uploaded_url))
+                ids.append(await send_target("", media_url=uploaded_url))
             else:
-                ids.append(await client.send_message(target, "", media_url=media_str))
+                ids.append(await send_target("", media_url=media_str))
 
         return {"success": True, "message_id": ",".join(ids) if ids else ""}
     except Exception as exc:
@@ -1184,11 +1388,16 @@ def interactive_setup() -> None:
     save_env_value("SENDBLUE_ALLOWED_USERS", ",".join(_normalize_phone(p) for p in allowed.split(",") if p.strip()))
 
     home = prompt(
-        "Default delivery phone for cron/notifications (optional)",
+        "Default delivery phone or group id for cron/notifications (optional)",
         default=get_env_value("SENDBLUE_HOME_CHANNEL") or "",
     )
     if home:
-        save_env_value("SENDBLUE_HOME_CHANNEL", _normalize_phone(home))
+        try:
+            _, home_target = _resolve_message_target(home)
+        except ValueError as exc:
+            print_warning(f"{exc}; SENDBLUE_HOME_CHANNEL was not changed.")
+        else:
+            save_env_value("SENDBLUE_HOME_CHANNEL", home_target)
 
     if prompt_yes_no("Enable webhook mode? (requires a public HTTPS tunnel/proxy)", False):
         secret = prompt(f"Webhook secret (minimum {MIN_WEBHOOK_SECRET_CHARS} chars)", password=True)
