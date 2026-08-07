@@ -80,6 +80,10 @@ SENDBLUE_MEDIA_DOWNLOAD_TIMEOUT = 30.0  # seconds; matches base.py URL-cache hel
 SENDBLUE_MAX_INBOUND_MEDIA_BYTES = 25 * 1024 * 1024  # bound each inbound media download
 GROUP_ID_MAX_LENGTH = 160
 GROUP_ID_ALLOWED_CHARS_PATTERN = re.compile(r"^[A-Za-z0-9+@._:-]+$")
+# A one-recipient "group" is really a 1:1 thread: Sendblue returns no group_id
+# for it, and any reply arrives without one, so it would route back as a DM and
+# strand the id we handed out. Refuse rather than create that dead end.
+GROUP_MIN_RECIPIENTS = 2
 
 # Sendblue/iMessage has no stable @identity for the bot. Keep the same default
 # wake words as Hermes' BlueBubbles and Photon adapters.
@@ -206,6 +210,26 @@ def _normalize_phone(value: str) -> str:
     if len(digits) == 10:
         return f"+1{digits}"
     return f"+{digits}" if digits else raw
+
+
+def _parse_allowlist(raw: Any) -> set:
+    """Split an allowlist setting into normalized entries; ``*`` passes through.
+
+    Core matches allowlist entries as exact strings (gateway/authz_mixin.py),
+    but ``interactive_setup`` already writes normalized numbers, so normalizing
+    both sides here only ever prevents a false rejection of the same number in
+    a different format.
+    """
+    if raw is None:
+        return set()
+    parts = raw if isinstance(raw, list) else str(raw).split(",")
+    entries = set()
+    for part in parts:
+        text = str(part).strip()
+        if not text:
+            continue
+        entries.add("*" if text == "*" else _normalize_phone(text))
+    return entries
 
 
 def _resolve_message_target(value: Any) -> tuple[str, str]:
@@ -370,6 +394,8 @@ class SendblueSettings:
     webhook_secret: str = ""
     require_mention: bool = False
     mention_patterns_raw: Any = None
+    allowed_users_raw: Any = ""
+    allow_all_users: bool = False
 
 
 def _settings_from_config(config: Any) -> SendblueSettings:
@@ -410,6 +436,24 @@ def _settings_from_config(config: Any) -> SendblueSettings:
         if "mention_patterns" in extra
         else os.getenv("SENDBLUE_MENTION_PATTERNS")
     )
+    # Deliberately env-only, unlike require_mention above. Core reads the
+    # allowlist from the environment alone (gateway/authz_mixin.py resolves
+    # allowed_users_env / allow_all_env off os.getenv) and ignores config.yaml.
+    # Honoring a config-only allowlist here would let outbound group creation
+    # and inbound authorization disagree about who is trusted.
+    # Both vars are unioned, not first-wins, because core unions them too.
+    allowed_users_raw = ",".join(
+        value
+        for value in (
+            os.getenv("SENDBLUE_ALLOWED_USERS"),
+            os.getenv("GATEWAY_ALLOWED_USERS"),
+        )
+        if value and value.strip()
+    )
+    # Only the platform flag, not GATEWAY_ALLOW_ALL_USERS: core honors the
+    # global one solely when no allowlist is configured at all, which
+    # _require_allowed already treats as unrestricted.
+    allow_all_users = _is_truthy(os.getenv("SENDBLUE_ALLOW_ALL_USERS"))
 
     return SendblueSettings(
         api_key=str(api_key).strip(),
@@ -451,6 +495,8 @@ def _settings_from_config(config: Any) -> SendblueSettings:
         ),
         require_mention=_is_truthy(require_mention_raw),
         mention_patterns_raw=mention_patterns_raw,
+        allowed_users_raw=allowed_users_raw,
+        allow_all_users=allow_all_users,
     )
 
 
@@ -534,13 +580,18 @@ class SendblueClient:
         messages.sort(key=lambda msg: _parse_datetime(msg.get("date_sent") or msg.get("date_created")))
         return messages
 
-    async def _send_one(
+    async def _post_message(
         self,
         target: Dict[str, Any],
         path: str,
         content: str,
         media_url: str,
-    ) -> str:
+    ) -> Dict[str, Any]:
+        """POST a Sendblue message and return the whole response payload.
+
+        Group creation needs ``group_id`` out of the response, which the
+        message-id-only ``_send_one`` contract cannot carry.
+        """
         body = dict(target)
         body["from_number"] = self.settings.phone_number
         if content:
@@ -550,13 +601,25 @@ class SendblueClient:
         if not body.get("content") and not body.get("media_url"):
             raise ValueError("Sendblue message requires content or media_url")
 
-        payload = await asyncio.to_thread(
+        return await asyncio.to_thread(
             self._json_request_sync,
             "POST",
             path,
             body=body,
         )
+
+    @staticmethod
+    def _message_id_from(payload: Dict[str, Any]) -> str:
         return str(payload.get("message_handle") or payload.get("id") or int(time.time() * 1000))
+
+    async def _send_one(
+        self,
+        target: Dict[str, Any],
+        path: str,
+        content: str,
+        media_url: str,
+    ) -> str:
+        return self._message_id_from(await self._post_message(target, path, content, media_url))
 
     async def send_message(
         self,
@@ -579,6 +642,12 @@ class SendblueClient:
         *,
         media_url: str = "",
     ) -> str:
+        """Send into an existing group.
+
+        Deliberately has no ``numbers`` parameter: creation lives in
+        ``create_group`` so that exactly one code path can put a ``numbers``
+        array on the wire, and the allowlist has a single chokepoint.
+        """
         target = str(group_id or "").strip()
         if not _is_group_chat_id(target):
             raise ValueError("Invalid Sendblue group id")
@@ -587,6 +656,97 @@ class SendblueClient:
             "/api/send-group-message",
             content,
             media_url,
+        )
+
+    def _require_allowed(self, numbers: List[str]) -> None:
+        """Reject outbound recipients outside the configured allowlist.
+
+        Skipped when allow-all is set or no allowlist is configured, mirroring
+        core: gateway/authz_mixin.py falls through to pairing and global policy
+        when a platform has no allowlist of its own. The adapter cannot see the
+        pairing store, so a number approved only by pairing is rejected here
+        even though inbound traffic from it is accepted -- deliberately
+        stricter for an operation that reaches out to a stranger.
+        """
+        if self.settings.allow_all_users:
+            return
+        allowed = _parse_allowlist(self.settings.allowed_users_raw)
+        if not allowed or "*" in allowed:
+            return
+        blocked = [number for number in numbers if number not in allowed]
+        if blocked:
+            raise ValueError(
+                "Recipients are not in SENDBLUE_ALLOWED_USERS: "
+                + ", ".join(_redacted_phone(number) for number in blocked)
+            )
+
+    async def create_group(
+        self,
+        numbers: List[str],
+        content: str = "",
+        *,
+        media_url: str = "",
+    ) -> tuple[str, str]:
+        """Create a group by seeding it with a message.
+
+        Returns ``(group_id, message_id)``. Sendblue has no create-only
+        endpoint: the group comes into being when the first message is sent to
+        a ``numbers`` array, and the new id comes back on that response.
+        """
+        seen = set()
+        recipients: List[str] = []
+        for number in numbers or []:
+            normalized = _normalize_phone(number)
+            # Dropping our own line is not cosmetic: passing it is a plausible
+            # caller mistake and it would otherwise count toward the minimum.
+            if not normalized or normalized == self.settings.phone_number:
+                continue
+            if normalized not in seen:
+                seen.add(normalized)
+                recipients.append(normalized)
+
+        if len(recipients) < GROUP_MIN_RECIPIENTS:
+            raise ValueError(
+                f"Sendblue group creation requires at least {GROUP_MIN_RECIPIENTS} "
+                "distinct recipients; use send() for a one-to-one thread"
+            )
+        self._require_allowed(recipients)
+
+        payload = await self._post_message(
+            {"numbers": recipients},
+            "/api/send-group-message",
+            content,
+            media_url,
+        )
+
+        group_id = str(payload.get("group_id") or "").strip()
+        if not _is_group_chat_id(group_id):
+            # The group-id contract was derived from inbound payloads. If
+            # creation ever returns a differently shaped id, this is where it
+            # surfaces -- log enough to diagnose without leaking the payload.
+            logger.warning(
+                "Sendblue group creation returned an unusable group_id (len=%d, keys=%s)",
+                len(group_id),
+                ",".join(sorted(str(key) for key in payload.keys())),
+            )
+            raise ValueError("Sendblue group creation returned an unusable group id")
+        return group_id, self._message_id_from(payload)
+
+    async def add_recipient_to_group(self, group_id: str, number: str) -> Dict[str, Any]:
+        """Add one recipient to an existing group via ``/api/modify-group``."""
+        target = str(group_id or "").strip()
+        if not _is_group_chat_id(target):
+            raise ValueError("Invalid Sendblue group id")
+        recipient = _normalize_phone(number)
+        if not recipient:
+            raise ValueError("Sendblue modify-group requires add_recipient")
+        self._require_allowed([recipient])
+
+        return await asyncio.to_thread(
+            self._json_request_sync,
+            "POST",
+            "/api/modify-group",
+            body={"group_id": target, "add_recipient": recipient},
         )
 
     async def send_typing_indicator(self, to_number: str) -> None:
@@ -1247,6 +1407,65 @@ class SendblueAdapter(BasePlatformAdapter):
         if kind == "group":
             return {"name": f"Sendblue group {target[-6:]}", "type": "group", "id": target}
         return {"name": target, "type": "dm", "id": target}
+
+    # ------------------------------------------------------------------
+    # Group creation & management
+    #
+    # Not part of the BasePlatformAdapter contract -- plain public methods, as
+    # with MatrixAdapter.create_room() / invite_user().
+    # ------------------------------------------------------------------
+
+    async def create_group(
+        self,
+        numbers: List[str],
+        content: str = "",
+        *,
+        media_url: str = "",
+    ) -> SendResult:
+        """Create a group seeded with *content*.
+
+        On success ``raw_response`` carries ``{"group_id", "chat_id"}``. Both
+        hold the same value; ``chat_id`` is the name the caller wants, because
+        it can be passed straight back into ``send()``.
+        """
+        try:
+            # Only the first chunk can ride the creation POST -- it is the one
+            # that carries `numbers`. The rest go to the id it returns.
+            chunks = _split_message(self.format_message(content)) or [""]
+            group_id, first_id = await self.client.create_group(
+                numbers, chunks[0], media_url=media_url
+            )
+            message_ids = [first_id]
+            for chunk in chunks[1:]:
+                message_ids.append(await self._send_chunk("group", group_id, chunk))
+            return SendResult(
+                success=True,
+                message_id=",".join(message_ids),
+                raw_response={"group_id": group_id, "chat_id": group_id},
+            )
+        except ValueError as exc:
+            return SendResult(success=False, error=str(exc), retryable=False)
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc), retryable=True)
+
+    async def add_recipient_to_group(self, chat_id: str, number: str) -> SendResult:
+        """Add one recipient to the group addressed by *chat_id*."""
+        try:
+            kind, target = self._resolve_target(chat_id)
+            if kind != "group":
+                return SendResult(
+                    success=False,
+                    error="add_recipient_to_group requires a Sendblue group id",
+                    retryable=False,
+                )
+            payload = await self.client.add_recipient_to_group(target, number)
+            # Sendblue returns a bare status; there is no roster read-back, so
+            # do not claim more than that the call was accepted.
+            return SendResult(success=True, raw_response=payload)
+        except ValueError as exc:
+            return SendResult(success=False, error=str(exc), retryable=False)
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc), retryable=True)
 
 
 def check_requirements() -> bool:

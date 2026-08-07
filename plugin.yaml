@@ -21,11 +21,11 @@ requires_env:
     password: false
 optional_env:
   - name: SENDBLUE_ALLOWED_USERS
-    description: "Comma-separated phone numbers allowed to talk to Hermes. Leave empty to use Hermes pairing."
+    description: "Comma-separated phone numbers allowed to talk to Hermes. Leave empty to use Hermes pairing. Also gates outbound group recipients: create_group and add_recipient_to_group refuse numbers not listed here."
     prompt: "Allowed phone numbers"
     password: false
   - name: SENDBLUE_ALLOW_ALL_USERS
-    description: "Allow any sender to talk to Hermes. Not recommended for agents with terminal access."
+    description: "Allow any sender to talk to Hermes, and any number to be added to a group. Not recommended for agents with terminal access."
     prompt: "Allow all users? (true/false)"
     password: false
   - name: SENDBLUE_HOME_CHANNEL

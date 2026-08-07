@@ -14,6 +14,8 @@ This is the Hermes Agent version of `openclaw-sendblue`: a third-party Hermes pl
 - Cron/notification delivery with `deliver=sendblue` and `SENDBLUE_HOME_CHANNEL`
 - Public CDN-style image URL delivery as Sendblue media attachments
 - Local file attachments uploaded automatically via Sendblue's `/api/upload-file` (max 100 MB)
+- Group conversations as first-class chats, keyed on Sendblue's `group_id`, with optional wake-word gating
+- Creating a group from a list of numbers, and adding recipients to an existing one
 
 ## Quick Start
 
@@ -93,6 +95,49 @@ hermes gateway restart
 ```
 
 Text your Sendblue number from a phone listed in `SENDBLUE_ALLOWED_USERS`. Hermes should reply in the same thread.
+
+## Group Conversations
+
+Sendblue group messages are available on select plans. A group is addressed by its Sendblue `group_id`, used directly as the Hermes chat ID — no prefix or namespace:
+
+```text
+sb_group_XXXXXXXX
+```
+
+Inbound group messages are separated from DMs: `chat_type` is `group`, `chat_id` is the `group_id`, and `user_id` stays the individual sender's number, so group threads get their own Hermes session instead of collapsing into the sender's DM. Outbound replies go to `POST /api/send-group-message` with that `group_id`. Typing indicators and read receipts are suppressed for groups — those Sendblue endpoints take a phone number and would reject a group id.
+
+A `group_id` is also a valid `SENDBLUE_HOME_CHANNEL`, so cron jobs and notifications can be delivered to a group.
+
+### Wake words
+
+By default Hermes answers every message in a group. Set `SENDBLUE_REQUIRE_MENTION=true` to make it reply only when addressed:
+
+```bash
+SENDBLUE_REQUIRE_MENTION=true
+SENDBLUE_MENTION_PATTERNS="hermes,hey sendblue"   # regexes; defaults to hermes / hermes agent
+```
+
+The matched wake word is stripped before the text reaches the agent. DMs are never gated. Note this applies to groups Hermes creates too — with `require_mention` on, Hermes will open a group and then ignore it until someone says the wake word.
+
+### Creating groups and adding recipients
+
+```python
+result = await adapter.create_group(["+15550101001", "+15550101002"], "starting a thread")
+group_id = result.raw_response["chat_id"]      # pass straight back to adapter.send()
+
+await adapter.add_recipient_to_group(group_id, "+15550101003")
+```
+
+Both return a `SendResult`; failures carry Sendblue's error text, with `retryable=False` for validation errors and `retryable=True` for transport errors.
+
+Details worth knowing:
+
+- **Two recipients minimum.** A one-recipient "group" is really a 1:1 thread — Sendblue returns no `group_id` for it, and replies would arrive without one and route back as a DM. Use `send()` for one-to-one.
+- **The allowlist applies.** Every number passed to `create_group` or `add_recipient_to_group` must be in `SENDBLUE_ALLOWED_USERS`, unless `SENDBLUE_ALLOW_ALL_USERS=true` or the allowlist is empty. This is deliberately stricter than inbound: a number approved through Hermes' pairing flow but absent from the allowlist is still rejected, because creating a group reaches out to someone who has not contacted you.
+- **All recipients need an iMessage route.** Mixed rosters may downgrade to SMS/MMS or fail outright.
+- **The seed message is not in session history.** The Hermes session for a new group starts on the first *inbound* message, so the agent will not remember the text it opened the group with.
+- **`/api/modify-group` returns a bare status.** There is no roster read-back, so a successful call means Sendblue accepted the request, not that the recipient is confirmed in the group.
+- Removing recipients, renaming, and leaving a group are not implemented.
 
 ## Access Control
 
