@@ -12,6 +12,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
 import threading
@@ -1386,6 +1387,82 @@ class SendblueAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc), retryable=False)
         except Exception as exc:
             return SendResult(success=False, error=str(exc), retryable=True)
+
+    async def _send_with_retry(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Any = None,
+        max_retries: int = 2,
+        base_delay: float = 2.0,
+    ) -> SendResult:
+        """Retry transient sends without the base Markdown-fallback banner.
+
+        Sendblue's :meth:`send` already strips Markdown, so a permanent send
+        failure cannot be repaired by prepending the base adapter's
+        ``(Response formatting failed, plain text:)`` notice and sending the
+        same response again.  Keep the base exponential-backoff behavior for
+        connection failures, but return permanent and delivery-ambiguous
+        failures unchanged.
+        """
+        result = await self.send(
+            chat_id=chat_id,
+            content=content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if result.success:
+            return result
+
+        error_str = result.error or ""
+        pattern_retryable = self._is_retryable_error(error_str)
+
+        # Sendblue currently marks broad request exceptions retryable.  A
+        # read/write timeout is different: the API may have accepted the
+        # non-idempotent send, so retrying could deliver a duplicate.  A
+        # recognized connection failure (including ConnectTimeout) is safe.
+        if self._is_timeout_error(error_str) and not pattern_retryable:
+            return result
+
+        if not (result.retryable or pattern_retryable):
+            logger.warning("[sendblue] Send failed permanently: %s", error_str)
+            return result
+
+        for attempt in range(1, max_retries + 1):
+            delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+            logger.warning(
+                "[sendblue] Send failed (attempt %d/%d, retrying in %.1fs): %s",
+                attempt,
+                max_retries,
+                delay,
+                error_str,
+            )
+            await asyncio.sleep(delay)
+            result = await self.send(
+                chat_id=chat_id,
+                content=content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            if result.success:
+                logger.info("[sendblue] Send succeeded on retry %d", attempt)
+                return result
+
+            error_str = result.error or ""
+            pattern_retryable = self._is_retryable_error(error_str)
+            if self._is_timeout_error(error_str) and not pattern_retryable:
+                return result
+            if not (result.retryable or pattern_retryable):
+                logger.warning("[sendblue] Send failed permanently: %s", error_str)
+                return result
+
+        logger.error(
+            "[sendblue] Failed to deliver response after %d retries: %s",
+            max_retries,
+            error_str,
+        )
+        return result
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         del metadata
