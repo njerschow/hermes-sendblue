@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -115,40 +119,98 @@ class IsLocalMediaTests(unittest.TestCase):
         self.assertFalse(adapter._is_local_media(None))
 
 
-class BuildMultipartTests(unittest.TestCase):
-    def test_includes_boundary_header_and_footer(self) -> None:
-        body = adapter._build_multipart("hello.png", b"\x89PNGdata", "BOUND123")
-        self.assertIn(b"--BOUND123\r\n", body)
-        self.assertTrue(body.endswith(b"\r\n--BOUND123--\r\n"))
-
-    def test_includes_form_field_name_and_filename(self) -> None:
-        body = adapter._build_multipart("doc.pdf", b"PDFBYTES", "BX")
-        self.assertIn(b'name="file"', body)
-        self.assertIn(b'filename="doc.pdf"', body)
-
-    def test_uses_octet_stream_content_type(self) -> None:
-        body = adapter._build_multipart("x", b"y", "BX")
-        self.assertIn(b"Content-Type: application/octet-stream", body)
-
-    def test_payload_bytes_are_embedded(self) -> None:
-        payload = b"\x00\x01\x02RAW\xff"
-        body = adapter._build_multipart("any.bin", payload, "BX")
-        self.assertIn(payload, body)
-
-    def test_filename_strips_quotes_and_newlines(self) -> None:
-        body = adapter._build_multipart('weird"\nname.png', b"x", "BX")
-        # Sanitized name should appear in the header.
-        self.assertIn(b'filename="weirdname.png"', body)
-
-
 class UploadGuardTests(unittest.TestCase):
-    def _client(self) -> "adapter.SendblueClient":
-        settings = adapter.SendblueSettings(
+    @staticmethod
+    def _settings():
+        return adapter.SendblueSettings(
             api_key="k",
             api_secret="s",
             phone_number="+15550000000",
         )
-        return adapter.SendblueClient(settings)
+
+    def _client(self, handler=None) -> "adapter.SendblueClient":
+        transport = httpx.MockTransport(handler) if handler is not None else None
+        return adapter.SendblueClient(self._settings(), transport=transport)
+
+    def test_upload_posts_httpx_multipart_contract(self) -> None:
+        captured: dict = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured["method"] = request.method
+            captured["url"] = str(request.url)
+            captured["headers"] = request.headers
+            captured["body"] = await request.aread()
+            captured["timeout"] = request.extensions["timeout"]
+            return httpx.Response(
+                200, json={"status": "OK", "media_url": "https://cdn.sendblue.test/abc"}
+            )
+
+        async def run() -> str:
+            async with self._client(handler) as client:
+                return await client.upload_file_from_bytes(
+                    'weird"\nname.png', b"\x00\x01RAW\xff"
+                )
+
+        url = asyncio.run(run())
+        self.assertEqual(url, "https://cdn.sendblue.test/abc")
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["url"], "https://api.sendblue.com/api/upload-file")
+        self.assertIn("multipart/form-data; boundary=", captured["headers"]["content-type"])
+        self.assertEqual(captured["headers"]["sb-api-key-id"], "k")
+        self.assertEqual(captured["headers"]["sb-api-secret-key"], "s")
+        self.assertIn(b'name="file"', captured["body"])
+        self.assertIn(b'filename="weirdname.png"', captured["body"])
+        self.assertIn(b"Content-Type: application/octet-stream", captured["body"])
+        self.assertIn(b"\x00\x01RAW\xff", captured["body"])
+        self.assertEqual(captured["timeout"]["write"], 60.0)
+
+    def test_upload_raises_when_response_missing_media_url(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"status": "OK"})
+
+        async def run() -> None:
+            async with self._client(handler) as client:
+                await client.upload_file_from_bytes("x.png", b"data")
+
+        with self.assertRaisesRegex(RuntimeError, "no media_url"):
+            asyncio.run(run())
+
+    def test_upload_http_error_preserves_status_and_body(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(413, text="too large upstream")
+
+        async def run() -> None:
+            async with self._client(handler) as client:
+                await client.upload_file_from_bytes("x.png", b"data")
+
+        with self.assertRaisesRegex(RuntimeError, "API error 413: too large upstream"):
+            asyncio.run(run())
+
+    def test_upload_connection_error_is_wrapped(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("network down", request=request)
+
+        async def run() -> None:
+            async with self._client(handler) as client:
+                await client.upload_file_from_bytes("x.png", b"data")
+
+        with self.assertRaisesRegex(RuntimeError, "API connection error: network down"):
+            asyncio.run(run())
+
+    def test_client_context_closes_httpx_client(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={})
+
+        async def run():
+            client = self._client(handler)
+            async with client:
+                opened = client._http_client
+                self.assertIsNotNone(opened)
+            return client, opened
+
+        client, opened = asyncio.run(run())
+        self.assertIsNone(client._http_client)
+        self.assertTrue(opened.is_closed)
 
     def test_empty_bytes_rejected(self) -> None:
         client = self._client()
@@ -166,35 +228,248 @@ class UploadGuardTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             asyncio.run(client.upload_file("/nonexistent/path/that/does/not/exist.png"))
 
-    def test_upload_posts_to_expected_endpoint(self) -> None:
-        client = self._client()
+
+class HttpClientTests(unittest.TestCase):
+    @staticmethod
+    def _settings():
+        settings = adapter.SendblueSettings(
+            api_key="k",
+            api_secret="s",
+            phone_number="+15550000000",
+        )
+        return settings
+
+    def test_json_request_uses_json_and_auth_headers(self) -> None:
         captured: dict = {}
 
-        def fake_post(path, headers, body, *, timeout=60.0):
-            captured["path"] = path
-            captured["headers"] = headers
-            captured["body"] = body
-            return {"status": "OK", "media_url": "https://cdn.sendblue.test/abc"}
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured["request"] = request
+            captured["body"] = await request.aread()
+            return httpx.Response(200, json={"message_handle": "m-1"})
 
-        with patch.object(client, "_raw_post_sync", side_effect=fake_post):
-            url = asyncio.run(client.upload_file_from_bytes("hi.png", b"PNGBYTES"))
+        async def run() -> str:
+            client = adapter.SendblueClient(
+                self._settings(), transport=httpx.MockTransport(handler)
+            )
+            async with client:
+                return await client.send_message("+15551112222", "hello")
 
-        self.assertEqual(url, "https://cdn.sendblue.test/abc")
-        self.assertEqual(captured["path"], "/api/upload-file")
-        self.assertIn("multipart/form-data; boundary=", captured["headers"]["Content-Type"])
-        self.assertIn("sb-api-key-id", captured["headers"])
-        self.assertIn(b'name="file"', captured["body"])
-        self.assertIn(b"PNGBYTES", captured["body"])
+        self.assertEqual(asyncio.run(run()), "m-1")
+        request = captured["request"]
+        self.assertEqual(request.method, "POST")
+        self.assertEqual(request.url.path, "/api/send-message")
+        self.assertEqual(request.headers["sb-api-key-id"], "k")
+        self.assertEqual(request.headers["content-type"], "application/json")
+        self.assertEqual(
+            json.loads(captured["body"]),
+            {
+                "number": "+15551112222",
+                "from_number": "+15550000000",
+                "content": "hello",
+            },
+        )
 
-    def test_upload_raises_when_response_missing_media_url(self) -> None:
-        client = self._client()
+    def test_api_redirect_is_not_followed(self) -> None:
+        calls = []
 
-        def fake_post(path, headers, body, *, timeout=60.0):
-            return {"status": "OK"}
+        async def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return httpx.Response(302, headers={"Location": "https://other.test/secret"})
 
-        with patch.object(client, "_raw_post_sync", side_effect=fake_post):
-            with self.assertRaises(RuntimeError):
-                asyncio.run(client.upload_file_from_bytes("x.png", b"data"))
+        async def run() -> None:
+            client = adapter.SendblueClient(
+                self._settings(), transport=httpx.MockTransport(handler)
+            )
+            async with client:
+                await client.send_message("+15551112222", "hello")
+
+        with self.assertRaisesRegex(RuntimeError, "API error 302"):
+            asyncio.run(run())
+        self.assertEqual(calls, ["https://api.sendblue.com/api/send-message"])
+
+    def test_polling_filters_are_encoded_as_query_parameters(self) -> None:
+        captured = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured["request"] = request
+            return httpx.Response(200, json={"data": [], "pagination": {"total": 0}})
+
+        async def run():
+            client = adapter.SendblueClient(
+                self._settings(), transport=httpx.MockTransport(handler)
+            )
+            async with client:
+                return await client.list_inbound_messages(
+                    datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+                )
+
+        self.assertEqual(asyncio.run(run()), [])
+        request = captured["request"]
+        self.assertEqual(request.method, "GET")
+        self.assertEqual(request.url.path, "/api/v2/messages")
+        self.assertEqual(request.url.params["is_outbound"], "false")
+        self.assertEqual(request.url.params["sendblue_number"], "+15550000000")
+        self.assertEqual(request.url.params["offset"], "0")
+        self.assertEqual(request.url.params["created_at_gte"], "2026-08-10T11:59:58Z")
+
+    def test_request_cancellation_propagates(self) -> None:
+        async def run() -> None:
+            request_started = asyncio.Event()
+            never_finishes = asyncio.Event()
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                request_started.set()
+                await never_finishes.wait()
+                return httpx.Response(200, json={})
+
+            client = adapter.SendblueClient(
+                self._settings(), transport=httpx.MockTransport(handler)
+            )
+            async with client:
+                task = asyncio.create_task(
+                    client.send_message("+15551112222", "hello")
+                )
+                await request_started.wait()
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+        asyncio.run(run())
+
+    def test_check_requirements_tracks_httpx_availability(self) -> None:
+        with patch.object(adapter, "HTTPX_AVAILABLE", False):
+            self.assertFalse(adapter.check_requirements())
+
+
+class _ChunkStream(httpx.AsyncByteStream):
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            yield chunk
+
+
+class MediaDownloadTests(unittest.TestCase):
+    @staticmethod
+    def _settings():
+        return adapter.SendblueSettings(
+            api_key="k",
+            api_secret="s",
+            phone_number="+15550000000",
+        )
+
+    def _client(self, handler) -> "adapter.SendblueClient":
+        return adapter.SendblueClient(
+            self._settings(), transport=httpx.MockTransport(handler)
+        )
+
+    def test_streams_media_and_normalizes_content_type_without_api_secrets(self) -> None:
+        captured = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured["headers"] = request.headers
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "image/png; charset=binary"},
+                stream=_ChunkStream([b"abc", b"def"]),
+            )
+
+        async def run():
+            async with self._client(handler) as client:
+                return await client.download_media("https://cdn.sendblue.test/image.png")
+
+        data, content_type = asyncio.run(run())
+        self.assertEqual(data, b"abcdef")
+        self.assertEqual(content_type, "image/png")
+        self.assertNotIn("sb-api-key-id", captured["headers"])
+        self.assertNotIn("sb-api-secret-key", captured["headers"])
+
+    def test_accepts_exact_limit_and_rejects_first_byte_over_limit(self) -> None:
+        async def exact_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, stream=_ChunkStream([b"abc", b"def"]))
+
+        async def oversized_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, stream=_ChunkStream([b"abc", b"def", b"g"]))
+
+        async def download(handler):
+            async with self._client(handler) as client:
+                return await client.download_media("https://cdn.sendblue.test/file")
+
+        with patch.object(adapter, "SENDBLUE_MAX_INBOUND_MEDIA_BYTES", 6):
+            data, _ = asyncio.run(download(exact_handler))
+            self.assertEqual(data, b"abcdef")
+            with self.assertRaisesRegex(RuntimeError, "Inbound media exceeds 6 bytes"):
+                asyncio.run(download(oversized_handler))
+
+    def test_rejects_non_https_before_opening_client(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("transport must not be reached")
+
+        client = self._client(handler)
+        with self.assertRaisesRegex(RuntimeError, "Refusing non-HTTPS"):
+            asyncio.run(client.download_media("http://cdn.sendblue.test/file"))
+        self.assertIsNone(client._http_client)
+
+    def test_follows_public_https_redirect_without_credentials(self) -> None:
+        requests = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.url.host == "cdn.sendblue.test":
+                return httpx.Response(
+                    302, headers={"Location": "https://assets.sendblue.test/final"}
+                )
+            return httpx.Response(200, content=b"media")
+
+        async def run():
+            async with self._client(handler) as client:
+                return await client.download_media("https://cdn.sendblue.test/start")
+
+        data, _ = asyncio.run(run())
+        self.assertEqual(data, b"media")
+        self.assertEqual(
+            [request.url.host for request in requests],
+            ["cdn.sendblue.test", "assets.sendblue.test"],
+        )
+        for request in requests:
+            self.assertNotIn("sb-api-key-id", request.headers)
+
+    def test_rejects_authenticated_cross_origin_redirect(self) -> None:
+        calls = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(
+                302, headers={"Location": "https://other.test/final"}
+            )
+
+        async def run():
+            async with self._client(handler) as client:
+                await client.download_media(
+                    "https://cdn.sendblue.test/start", authenticated=True
+                )
+
+        with self.assertRaisesRegex(RuntimeError, "credentials across media origins"):
+            asyncio.run(run())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].headers["sb-api-key-id"], "k")
+
+    def test_wraps_media_http_and_connection_errors(self) -> None:
+        async def status_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, text="missing")
+
+        async def connection_handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("stalled", request=request)
+
+        async def download(handler):
+            async with self._client(handler) as client:
+                return await client.download_media("https://cdn.sendblue.test/file")
+
+        with self.assertRaisesRegex(RuntimeError, "media download error 404"):
+            asyncio.run(download(status_handler))
+        with self.assertRaisesRegex(RuntimeError, "connection error: stalled"):
+            asyncio.run(download(connection_handler))
 
 
 class FormatMessageTests(unittest.TestCase):

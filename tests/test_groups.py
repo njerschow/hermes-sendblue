@@ -61,11 +61,11 @@ class _Base(unittest.TestCase):
         client = adapter.SendblueClient(self._settings(**settings_over))
         calls = []
 
-        def request(method, path, *, query=None, body=None):
+        async def request(method, path, *, query=None, body=None, **kwargs):
             calls.append((method, path, query, body))
             return response
 
-        client._json_request_sync = request
+        client._json_request = request
         return client, calls
 
 
@@ -258,11 +258,11 @@ class ClientGroupTests(_Base):
         client = adapter.SendblueClient(settings)
         calls = []
 
-        def request(method, path, *, query=None, body=None):
+        async def request(method, path, *, query=None, body=None, **kwargs):
             calls.append((method, path, query, body))
             return {"message_handle": "m-group"}
 
-        client._json_request_sync = request
+        client._json_request = request
         result = asyncio.run(client.send_group_message(GROUP, "hello"))
 
         self.assertEqual(result, "m-group")
@@ -323,10 +323,17 @@ class ClientGroupTests(_Base):
 
     def test_standalone_home_channel_preserves_group_id(self):
         calls = []
+        closes = []
 
         class FakeClient:
             def __init__(self, settings):
                 self.settings = settings
+
+            async def open(self):
+                pass
+
+            async def aclose(self):
+                closes.append(True)
 
             async def send_group_message(self, group_id, content="", *, media_url=""):
                 calls.append((group_id, content, media_url))
@@ -347,6 +354,34 @@ class ClientGroupTests(_Base):
 
         self.assertTrue(result["success"])
         self.assertEqual(calls, [(GROUP, "cron hello", "")])
+        self.assertEqual(closes, [True])
+
+    def test_standalone_closes_client_after_transport_error(self):
+        closes = []
+
+        class FakeClient:
+            def __init__(self, settings):
+                self.settings = settings
+
+            async def open(self):
+                pass
+
+            async def aclose(self):
+                closes.append(True)
+
+            async def send_message(self, number, content="", *, media_url=""):
+                raise RuntimeError("network down")
+
+        config = SimpleNamespace(extra={
+            "api_key": "k",
+            "api_secret": "s",
+            "phone_number": OUR,
+        })
+        with patch.object(adapter, "SendblueClient", FakeClient):
+            result = asyncio.run(adapter._standalone_send(config, SENDER, "hello"))
+
+        self.assertIn("network down", result["error"])
+        self.assertEqual(closes, [True])
 
 
 class CreateGroupClientTests(_Base):
