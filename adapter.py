@@ -20,8 +20,21 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from urllib import error, parse, request
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from urllib import parse
+
+if TYPE_CHECKING:
+    import httpx
+
+    HTTPX_AVAILABLE = True
+else:
+    try:
+        import httpx
+
+        HTTPX_AVAILABLE = True
+    except ImportError:  # pragma: no cover - current Hermes includes httpx
+        httpx = None
+        HTTPX_AVAILABLE = False
 
 from gateway.config import Platform
 from gateway.platforms.base import (
@@ -34,6 +47,11 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
     cache_video_from_bytes,
 )
+
+try:
+    from gateway.platforms._http_client_limits import platform_httpx_limits
+except ImportError:  # pragma: no cover - compatibility with older Hermes cores
+    platform_httpx_limits = None
 
 # strip_markdown was consolidated into gateway.platforms.helpers when the
 # per-adapter copies in sms.py/bluebubbles.py/feishu.py were de-duplicated.
@@ -78,6 +96,7 @@ MIN_WEBHOOK_SECRET_CHARS = 16
 SENDBLUE_MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # Sendblue documented per-file limit
 SENDBLUE_MEDIA_DOWNLOAD_TIMEOUT = 30.0  # seconds; matches base.py URL-cache helpers
 SENDBLUE_MAX_INBOUND_MEDIA_BYTES = 25 * 1024 * 1024  # bound each inbound media download
+SENDBLUE_MAX_MEDIA_REDIRECTS = 5
 GROUP_ID_MAX_LENGTH = 160
 GROUP_ID_ALLOWED_CHARS_PATTERN = re.compile(r"^[A-Za-z0-9+@._:-]+$")
 # A one-recipient "group" is really a 1:1 thread: Sendblue returns no group_id
@@ -357,15 +376,8 @@ def _is_local_media(value: Any) -> bool:
     return bool(text) and not text.startswith(("http://", "https://"))
 
 
-def _build_multipart(filename: str, data: bytes, boundary: str) -> bytes:
-    safe_name = filename.replace('"', "").replace("\r", "").replace("\n", "")
-    header = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="file"; filename="{safe_name}"\r\n'
-        f"Content-Type: application/octet-stream\r\n\r\n"
-    ).encode("utf-8")
-    footer = f"\r\n--{boundary}--\r\n".encode("utf-8")
-    return header + data + footer
+def _sanitize_upload_filename(filename: str) -> str:
+    return filename.replace('"', "").replace("\r", "").replace("\n", "")
 
 
 def _hermes_home() -> Path:
@@ -501,8 +513,56 @@ def _settings_from_config(config: Any) -> SendblueSettings:
 
 
 class SendblueClient:
-    def __init__(self, settings: SendblueSettings):
+    def __init__(
+        self,
+        settings: SendblueSettings,
+        *,
+        transport: Optional[Any] = None,
+    ):
         self.settings = settings
+        self._transport = transport
+        self._http_client: Optional["httpx.AsyncClient"] = None
+
+    async def open(self) -> None:
+        if not HTTPX_AVAILABLE:
+            raise RuntimeError("Sendblue requires httpx, which is not installed")
+        if self._http_client is not None and not self._http_client.is_closed:
+            return
+
+        kwargs: Dict[str, Any] = {
+            "timeout": httpx.Timeout(30.0),
+            "follow_redirects": False,
+        }
+        if platform_httpx_limits is not None:
+            limits = platform_httpx_limits()
+            if limits is not None:
+                kwargs["limits"] = limits
+        else:
+            kwargs["limits"] = httpx.Limits(
+                max_keepalive_connections=10,
+                keepalive_expiry=2.0,
+            )
+        if self._transport is not None:
+            kwargs["transport"] = self._transport
+        self._http_client = httpx.AsyncClient(**kwargs)
+
+    async def aclose(self) -> None:
+        client = self._http_client
+        self._http_client = None
+        if client is not None and not client.is_closed:
+            await client.aclose()
+
+    async def __aenter__(self) -> "SendblueClient":
+        await self.open()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self.aclose()
+
+    async def _http(self) -> "httpx.AsyncClient":
+        await self.open()
+        assert self._http_client is not None
+        return self._http_client
 
     def _headers(self, *, content_type: Optional[str] = "application/json") -> Dict[str, str]:
         headers: Dict[str, str] = {
@@ -515,28 +575,37 @@ class SendblueClient:
             headers["Content-Type"] = content_type
         return headers
 
-    def _json_request_sync(
+    async def _json_request(
         self,
         method: str,
         path: str,
         *,
         query: Optional[Dict[str, str]] = None,
         body: Optional[Dict[str, Any]] = None,
+        files: Optional[Dict[str, Any]] = None,
+        timeout: float = 30.0,
     ) -> Dict[str, Any]:
         url = f"{self.settings.api_base}{path}"
-        if query:
-            url = f"{url}?{parse.urlencode(query)}"
-
-        payload = json.dumps(body).encode("utf-8") if body is not None else None
-        req = request.Request(url, data=payload, headers=self._headers(), method=method)
+        client = await self._http()
+        headers = self._headers(content_type=None if files is not None else "application/json")
         try:
-            with request.urlopen(req, timeout=30) as resp:
-                raw = resp.read().decode("utf-8")
-                return json.loads(raw) if raw else {}
-        except error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Sendblue API error {exc.code}: {raw}") from exc
-        except error.URLError as exc:
+            response = await client.request(
+                method,
+                url,
+                params=query,
+                json=body,
+                files=files,
+                headers=headers,
+                timeout=timeout,
+                follow_redirects=False,
+            )
+            response.raise_for_status()
+            return response.json() if response.content else {}
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"Sendblue API error {exc.response.status_code}: {exc.response.text}"
+            ) from exc
+        except httpx.RequestError as exc:
             raise RuntimeError(f"Sendblue API connection error: {exc}") from exc
 
     async def list_inbound_messages(self, since: datetime) -> List[Dict[str, Any]]:
@@ -557,8 +626,7 @@ class SendblueClient:
         offset = 0
         while True:
             query["offset"] = str(offset)
-            payload = await asyncio.to_thread(
-                self._json_request_sync,
+            payload = await self._json_request(
                 "GET",
                 "/api/v2/messages",
                 query=query,
@@ -601,8 +669,7 @@ class SendblueClient:
         if not body.get("content") and not body.get("media_url"):
             raise ValueError("Sendblue message requires content or media_url")
 
-        return await asyncio.to_thread(
-            self._json_request_sync,
+        return await self._json_request(
             "POST",
             path,
             body=body,
@@ -742,8 +809,7 @@ class SendblueClient:
             raise ValueError("Sendblue modify-group requires add_recipient")
         self._require_allowed([recipient])
 
-        return await asyncio.to_thread(
-            self._json_request_sync,
+        return await self._json_request(
             "POST",
             "/api/modify-group",
             body={"group_id": target, "add_recipient": recipient},
@@ -754,8 +820,7 @@ class SendblueClient:
             "number": _normalize_phone(to_number),
             "from_number": self.settings.phone_number,
         }
-        await asyncio.to_thread(
-            self._json_request_sync,
+        await self._json_request(
             "POST",
             "/api/send-typing-indicator",
             body=body,
@@ -766,32 +831,11 @@ class SendblueClient:
             "number": _normalize_phone(to_number),
             "from_number": self.settings.phone_number,
         }
-        await asyncio.to_thread(
-            self._json_request_sync,
+        await self._json_request(
             "POST",
             "/api/mark-read",
             body=body,
         )
-
-    def _raw_post_sync(
-        self,
-        path: str,
-        headers: Dict[str, str],
-        body: bytes,
-        *,
-        timeout: float = 60.0,
-    ) -> Dict[str, Any]:
-        url = f"{self.settings.api_base}{path}"
-        req = request.Request(url, data=body, headers=headers, method="POST")
-        try:
-            with request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8")
-                return json.loads(raw) if raw else {}
-        except error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Sendblue API error {exc.code}: {raw}") from exc
-        except error.URLError as exc:
-            raise RuntimeError(f"Sendblue API connection error: {exc}") from exc
 
     async def upload_file_from_bytes(self, filename: str, data: bytes) -> str:
         if not data:
@@ -802,13 +846,12 @@ class SendblueClient:
                 f"of {SENDBLUE_MAX_UPLOAD_BYTES} bytes"
             )
 
-        boundary = f"----SendblueUpload{int(time.time() * 1000)}{os.urandom(8).hex()}"
-        body = _build_multipart(filename, data, boundary)
-        headers = self._headers(content_type=None)
-        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
-
-        payload = await asyncio.to_thread(
-            self._raw_post_sync, "/api/upload-file", headers, body
+        safe_name = _sanitize_upload_filename(filename)
+        payload = await self._json_request(
+            "POST",
+            "/api/upload-file",
+            files={"file": (safe_name, data, "application/octet-stream")},
+            timeout=60.0,
         )
         media_url = payload.get("media_url")
         if not media_url:
@@ -822,9 +865,8 @@ class SendblueClient:
         data = await asyncio.to_thread(path.read_bytes)
         return await self.upload_file_from_bytes(path.name, data)
 
-    def _download_media_sync(
-        self, media_url: str, *, authenticated: bool = False
-    ) -> tuple[bytes, str]:
+    @staticmethod
+    def _validated_media_url(media_url: str) -> parse.ParseResult:
         # Sendblue CDN media URLs are always HTTPS. Requiring https blocks
         # file://, ftp://, etc. We deliberately skip a full SSRF/DNS check
         # (is_safe_url lives in tools.url_safety, outside gateway.platforms.base):
@@ -834,6 +876,13 @@ class SendblueClient:
         parsed = parse.urlparse(media_url)
         if parsed.scheme != "https" or not parsed.netloc:
             raise RuntimeError(f"Refusing non-HTTPS media URL: {media_url}")
+        return parsed
+
+    async def download_media(
+        self, media_url: str, *, authenticated: bool = False
+    ) -> tuple[bytes, str]:
+        """Download inbound media bytes; return (data, lowercased content-type)."""
+        initial = self._validated_media_url(media_url)
 
         # The download targets the CDN host, not api.sendblue.com, so by default we
         # do NOT send sb-api-key credentials (avoid leaking them to the CDN). Flip
@@ -843,29 +892,58 @@ class SendblueClient:
         else:
             headers = {"User-Agent": DEFAULT_USER_AGENT, "Accept": "*/*"}
 
-        req = request.Request(media_url, headers=headers, method="GET")
-        try:
-            with request.urlopen(req, timeout=SENDBLUE_MEDIA_DOWNLOAD_TIMEOUT) as resp:
-                # Read one byte past the cap so an oversized file is detectable.
-                data = resp.read(SENDBLUE_MAX_INBOUND_MEDIA_BYTES + 1)
-                if len(data) > SENDBLUE_MAX_INBOUND_MEDIA_BYTES:
-                    raise RuntimeError(
-                        f"Inbound media exceeds {SENDBLUE_MAX_INBOUND_MEDIA_BYTES} bytes"
-                    )
-                content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0]
-                return data, content_type.strip().lower()
-        except error.HTTPError as exc:
-            raise RuntimeError(f"Sendblue media download error {exc.code}") from exc
-        except error.URLError as exc:
-            raise RuntimeError(f"Sendblue media download connection error: {exc}") from exc
+        client = await self._http()
+        current_url = media_url
+        initial_origin = (initial.scheme.lower(), initial.netloc.lower())
+        for redirect_count in range(SENDBLUE_MAX_MEDIA_REDIRECTS + 1):
+            self._validated_media_url(current_url)
+            try:
+                async with client.stream(
+                    "GET",
+                    current_url,
+                    headers=headers,
+                    timeout=SENDBLUE_MEDIA_DOWNLOAD_TIMEOUT,
+                    follow_redirects=False,
+                ) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("Location")
+                        if not location or redirect_count >= SENDBLUE_MAX_MEDIA_REDIRECTS:
+                            raise RuntimeError(
+                                "Sendblue media download exceeded redirect limit"
+                            )
+                        next_url = parse.urljoin(str(response.url), location)
+                        next_parsed = self._validated_media_url(next_url)
+                        if authenticated and (
+                            next_parsed.scheme.lower(), next_parsed.netloc.lower()
+                        ) != initial_origin:
+                            raise RuntimeError(
+                                "Refusing to forward Sendblue credentials across media origins"
+                            )
+                        current_url = next_url
+                        continue
 
-    async def download_media(
-        self, media_url: str, *, authenticated: bool = False
-    ) -> tuple[bytes, str]:
-        """Download inbound media bytes; return (data, lowercased content-type)."""
-        return await asyncio.to_thread(
-            self._download_media_sync, media_url, authenticated=authenticated
-        )
+                    response.raise_for_status()
+                    data = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        data.extend(chunk)
+                        if len(data) > SENDBLUE_MAX_INBOUND_MEDIA_BYTES:
+                            raise RuntimeError(
+                                f"Inbound media exceeds {SENDBLUE_MAX_INBOUND_MEDIA_BYTES} bytes"
+                            )
+                    content_type = (response.headers.get("Content-Type") or "").split(
+                        ";", 1
+                    )[0]
+                    return bytes(data), content_type.strip().lower()
+            except httpx.HTTPStatusError as exc:
+                raise RuntimeError(
+                    f"Sendblue media download error {exc.response.status_code}"
+                ) from exc
+            except httpx.RequestError as exc:
+                raise RuntimeError(
+                    f"Sendblue media download connection error: {exc}"
+                ) from exc
+
+        raise RuntimeError("Sendblue media download exceeded redirect limit")
 
 
 class ProcessedMessageStore:
@@ -1032,18 +1110,21 @@ class SendblueAdapter(BasePlatformAdapter):
         if not self._acquire_platform_lock("sendblue", self.settings.phone_number, "Sendblue line"):
             return False
 
-        try:
-            if self.settings.webhook_enabled:
-                if not _is_valid_webhook_secret(self.settings.webhook_secret):
-                    msg = (
-                        "Webhook mode requires SENDBLUE_WEBHOOK_SECRET with at least "
-                        f"{MIN_WEBHOOK_SECRET_CHARS} non-placeholder characters"
-                    )
-                    logger.error(msg)
-                    self._set_fatal_error("webhook_secret_missing", msg, retryable=False)
-                    self._release_platform_lock()
-                    return False
+        if self.settings.webhook_enabled and not _is_valid_webhook_secret(
+            self.settings.webhook_secret
+        ):
+            msg = (
+                "Webhook mode requires SENDBLUE_WEBHOOK_SECRET with at least "
+                f"{MIN_WEBHOOK_SECRET_CHARS} non-placeholder characters"
+            )
+            logger.error(msg)
+            self._set_fatal_error("webhook_secret_missing", msg, retryable=False)
+            self._release_platform_lock()
+            return False
 
+        try:
+            await self.client.open()
+            if self.settings.webhook_enabled:
                 self._webhook_server = SendblueWebhookServer(self, self.settings)
                 self._webhook_server.start()
                 logger.info(
@@ -1060,6 +1141,10 @@ class SendblueAdapter(BasePlatformAdapter):
             self._mark_connected()
             return True
         except Exception as exc:
+            try:
+                await self.client.aclose()
+            except Exception:
+                logger.debug("Sendblue HTTP client close failed", exc_info=True)
             self._release_platform_lock()
             self._set_fatal_error("connect_failed", str(exc), retryable=True)
             logger.error("Sendblue connect failed: %s", exc, exc_info=True)
@@ -1082,6 +1167,11 @@ class SendblueAdapter(BasePlatformAdapter):
         if self._webhook_server:
             await asyncio.to_thread(self._webhook_server.stop)
             self._webhook_server = None
+
+        try:
+            await self.client.aclose()
+        except Exception:
+            logger.debug("Sendblue HTTP client close failed", exc_info=True)
 
         self._release_platform_lock()
         self._store.close()
@@ -1469,8 +1559,8 @@ class SendblueAdapter(BasePlatformAdapter):
 
 
 def check_requirements() -> bool:
-    """No optional dependencies are required; Hermes supplies the gateway API."""
-    return True
+    """Return whether Hermes' HTTP client dependency is available."""
+    return HTTPX_AVAILABLE
 
 
 def validate_config(config: Any) -> bool:
@@ -1530,8 +1620,9 @@ async def _standalone_send(
     if not (settings.api_key and settings.api_secret and settings.phone_number):
         return {"error": "Sendblue standalone send: missing SENDBLUE_API_KEY, SENDBLUE_API_SECRET, or SENDBLUE_PHONE_NUMBER"}
 
+    client = SendblueClient(settings)
     try:
-        client = SendblueClient(settings)
+        await client.open()
         kind, target = _resolve_message_target(
             chat_id or _env_first("SENDBLUE_HOME_CHANNEL", "SENDBLUE_HOME_PHONE")
         )
@@ -1566,6 +1657,11 @@ async def _standalone_send(
         return {"success": True, "message_id": ",".join(ids) if ids else ""}
     except Exception as exc:
         return {"error": f"Sendblue standalone send failed: {exc}"}
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            logger.debug("Sendblue standalone HTTP client close failed", exc_info=True)
 
 
 def interactive_setup() -> None:
