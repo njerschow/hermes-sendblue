@@ -1094,7 +1094,7 @@ class SendblueAdapter(BasePlatformAdapter):
     def name(self) -> str:
         return "Sendblue"
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         missing = []
         if not self.settings.api_key:
             missing.append("SENDBLUE_API_KEY")
